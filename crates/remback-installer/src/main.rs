@@ -38,9 +38,50 @@ enum TaskEvent {
     Finished(Result<(), String>),
 }
 
+struct ExistingInstall {
+    version: String,
+    install_dir: PathBuf,
+}
+
+fn query_reg_sz(key: &str, value_name: &str) -> Option<String> {
+    let out = hidden_cmd("reg")
+        .args(["query", key, "/v", value_name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if line.contains(value_name) && line.contains("REG_SZ") {
+            if let Some((_, rhs)) = line.split_once("REG_SZ") {
+                let val = rhs.trim();
+                if !val.is_empty() {
+                    return Some(val.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_existing_install() -> Option<ExistingInstall> {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\RemBack";
+    let version = query_reg_sz(key, "DisplayVersion")?;
+    let install_dir = query_reg_sz(key, "InstallLocation")
+        .map(PathBuf::from)
+        .or_else(|| BaseDirs::new().map(|d| d.data_local_dir().join("RemBack")))?;
+    Some(ExistingInstall {
+        version,
+        install_dir,
+    })
+}
+
 struct InstallerApp {
     stage: Stage,
     splash: SplashState,
+    existing: Option<ExistingInstall>,
+    silent_update: bool,
     install_dir: String,
     desktop_shortcut: bool,
     start_menu_shortcut: bool,
@@ -52,20 +93,25 @@ struct InstallerApp {
 }
 
 impl InstallerApp {
-    fn new(cc: &eframe::CreationContext<'_>, uninstall_mode: bool) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, uninstall_mode: bool, silent_update: bool) -> Self {
         apply_theme(&cc.egui_ctx);
 
-        let default_dir = BaseDirs::new()
-            .map(|d| d.data_local_dir().join("RemBack"))
+        let existing = detect_existing_install();
+        let default_dir = existing
+            .as_ref()
+            .map(|e| e.install_dir.clone())
+            .or_else(|| BaseDirs::new().map(|d| d.data_local_dir().join("RemBack")))
             .unwrap_or_else(|| PathBuf::from("RemBack"));
 
-        Self {
+        let mut app = Self {
             stage: if uninstall_mode {
                 Stage::UninstallConfirm
             } else {
                 Stage::Configure
             },
             splash: SplashState::new(),
+            existing,
+            silent_update,
             install_dir: default_dir.to_string_lossy().into_owned(),
             desktop_shortcut: true,
             start_menu_shortcut: true,
@@ -74,7 +120,12 @@ impl InstallerApp {
             status_text: String::new(),
             error_message: String::new(),
             rx: None,
+        };
+        if silent_update && !uninstall_mode {
+            app.splash.finished = true;
+            app.start_install();
         }
+        app
     }
 
     fn start_install(&mut self) {
@@ -136,6 +187,12 @@ impl InstallerApp {
                         Ok(()) => {
                             self.progress = 1.0;
                             if self.stage == Stage::Installing {
+                                if self.silent_update {
+                                    let exe = PathBuf::from(&self.install_dir).join("remback.exe");
+                                    let _ = Command::new(exe).spawn();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    return;
+                                }
                                 self.stage = Stage::Done;
                             } else if self.stage == Stage::Uninstalling {
                                 self.stage = Stage::UninstallDone;
@@ -249,7 +306,16 @@ fn run_install_steps(
     }
 
     let _ = tx.send(TaskEvent::Progress(
-        0.15,
+        0.08,
+        "Comprobando si RemBack está abierto...".into(),
+    ));
+    let _ = hidden_cmd("taskkill")
+        .args(["/IM", "remback.exe", "/F"])
+        .output();
+    thread::sleep(std::time::Duration::from_millis(250));
+
+    let _ = tx.send(TaskEvent::Progress(
+        0.18,
         "Creando directorio de instalación...".into(),
     ));
     std::fs::create_dir_all(install_dir)
@@ -270,11 +336,31 @@ fn run_install_steps(
     }
 
     let target_exe = install_dir.join("remback.exe");
-    let mut f = File::create(&target_exe)
-        .map_err(|e| format!("No se pudo escribir {}: {e}", target_exe.display()))?;
+    let mut file_handle = None;
+    let mut last_err = None;
+    for _ in 0..12 {
+        match File::create(&target_exe) {
+            Ok(f) => {
+                file_handle = Some(f);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+    let mut f = file_handle.ok_or_else(|| {
+        format!(
+            "No se pudo escribir {} (cierra RemBack e inténtalo de nuevo): {}",
+            target_exe.display(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )
+    })?;
     f.write_all(&exe_bytes)
         .map_err(|e| format!("Error escribiendo binario: {e}"))?;
     f.flush().ok();
+    drop(f);
 
     let _ = tx.send(TaskEvent::Progress(
         0.60,
@@ -283,7 +369,12 @@ fn run_install_steps(
     let uninstall_exe = install_dir.join("uninstall.exe");
     if let Ok(self_exe) = std::env::current_exe() {
         if self_exe != uninstall_exe {
-            let _ = std::fs::copy(&self_exe, &uninstall_exe);
+            for _ in 0..5 {
+                if std::fs::copy(&self_exe, &uninstall_exe).is_ok() {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(150));
+            }
         }
     }
 
@@ -385,6 +476,14 @@ impl eframe::App for InstallerApp {
                                     .color(Palette::TEXT_PRIMARY),
                             );
                             badge_pill(ui, &format!("v{APP_VERSION}"), Palette::EMERALD_BRIGHT);
+                            if let Some(ex) = &self.existing {
+                                let txt = if ex.version == APP_VERSION {
+                                    format!("Instalada: v{}", ex.version)
+                                } else {
+                                    format!("Actualización: v{} → v{APP_VERSION}", ex.version)
+                                };
+                                badge_pill(ui, &txt, Palette::CYAN);
+                            }
                         });
                         ui.label(
                             RichText::new("GUI moderna en Rust para BackgroundMattingV2")
@@ -459,7 +558,12 @@ impl eframe::App for InstallerApp {
 
                         ui.add_space(18.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let inst_btn = primary_button(ui, "Instalar RemBack", true);
+                            let primary_lbl = if self.existing.is_some() {
+                                "Actualizar RemBack"
+                            } else {
+                                "Instalar RemBack"
+                            };
+                            let inst_btn = primary_button(ui, primary_lbl, true);
                             if inst_btn.clicked() {
                                 self.start_install();
                             }
@@ -610,6 +714,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let uninstall_mode = args.iter().any(|a| a == "--uninstall");
+    let silent_update = args.iter().any(|a| a == "--silent-update");
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("RemBack v{APP_VERSION} Setup"))
@@ -628,6 +733,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "RemBack Setup",
         options,
-        Box::new(move |cc| Ok(Box::new(InstallerApp::new(cc, uninstall_mode)))),
+        Box::new(move |cc| Ok(Box::new(InstallerApp::new(cc, uninstall_mode, silent_update)))),
     )
 }

@@ -10,7 +10,7 @@ use std::thread;
 
 use serde::Deserialize;
 
-use crate::config::MattingConfig;
+use crate::config::{ComputeDevice, EngineMode, MattingConfig};
 use crate::updater::UpdaterPaths;
 
 const WORKER_PY: &str = include_str!("remback_worker.py");
@@ -314,6 +314,12 @@ fn spawn_python_worker(
 fn build_common_args(cfg: &MattingConfig, paths: &UpdaterPaths) -> Vec<String> {
     let rgb = cfg.effective_bg_rgb();
     let mut args = vec![
+        "--engine".into(),
+        cfg.engine_mode.as_arg().into(),
+        "--rvm-backbone".into(),
+        cfg.simple_quality.rvm_backbone_arg().into(),
+        "--models-dir".into(),
+        paths.models_dir.to_string_lossy().into_owned(),
         "--bgmv2-dir".into(),
         paths.bgmv2_dir.to_string_lossy().into_owned(),
         "--video-src".into(),
@@ -344,6 +350,9 @@ fn build_common_args(cfg: &MattingConfig, paths: &UpdaterPaths) -> Vec<String> {
         paths.preview_dir.to_string_lossy().into_owned(),
     ];
 
+    if cfg.use_fp16 && cfg.device == ComputeDevice::Cuda {
+        args.push("--fp16".into());
+    }
     if cfg.auto_bgr {
         args.push("--auto-bgr".into());
     } else if !cfg.video_bgr.trim().is_empty() {
@@ -406,7 +415,7 @@ pub fn run_preview(paths: &UpdaterPaths, cfg: &MattingConfig) -> Result<WorkerHa
     let python = paths
         .active_python()
         .ok_or_else(|| "Entorno Python no configurado. Ábrelo desde 'Actualizaciones'.".to_owned())?;
-    if !paths.is_bgmv2_installed() {
+    if cfg.engine_mode == EngineMode::BgMattingV2 && !paths.is_bgmv2_installed() {
         return Err("BackgroundMattingV2 no está descargado. Instálalo en 'Actualizaciones'.".into());
     }
     let script = ensure_worker_script(paths)?;
@@ -426,7 +435,7 @@ pub fn run_export(paths: &UpdaterPaths, cfg: &MattingConfig) -> Result<WorkerHan
     let python = paths
         .active_python()
         .ok_or_else(|| "Entorno Python no configurado. Ábrelo desde 'Actualizaciones'.".to_owned())?;
-    if !paths.is_bgmv2_installed() {
+    if cfg.engine_mode == EngineMode::BgMattingV2 && !paths.is_bgmv2_installed() {
         return Err("BackgroundMattingV2 no está descargado. Instálalo en 'Actualizaciones'.".into());
     }
     let script = ensure_worker_script(paths)?;

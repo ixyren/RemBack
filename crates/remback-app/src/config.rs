@@ -4,6 +4,42 @@ use directories::{BaseDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UiMode {
+    Simple,
+    Advanced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineMode {
+    AutoNoRef,
+    BgMattingV2,
+}
+
+impl EngineMode {
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            EngineMode::AutoNoRef => "rvm",
+            EngineMode::BgMattingV2 => "bgmv2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SimpleQuality {
+    Balanced,
+    Fast,
+}
+
+impl SimpleQuality {
+    pub fn rvm_backbone_arg(&self) -> &'static str {
+        match self {
+            SimpleQuality::Balanced => "resnet50",
+            SimpleQuality::Fast => "mobilenetv3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelType {
     MattingRefine,
     MattingBase,
@@ -31,6 +67,22 @@ impl Backbone {
             Backbone::MobileNetV2 => "mobilenetv2",
             Backbone::ResNet50 => "resnet50",
             Backbone::ResNet101 => "resnet101",
+        }
+    }
+
+    pub fn detect_from_path(path: &str) -> Option<Self> {
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())?
+            .to_ascii_lowercase();
+        if name.contains("resnet101") {
+            Some(Self::ResNet101)
+        } else if name.contains("resnet50") {
+            Some(Self::ResNet50)
+        } else if name.contains("mobilenetv2") || name.contains("mobilenet") {
+            Some(Self::MobileNetV2)
+        } else {
+            None
         }
     }
 }
@@ -125,6 +177,11 @@ impl OutputLayer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MattingConfig {
+    pub ui_mode: UiMode,
+    pub engine_mode: EngineMode,
+    pub simple_quality: SimpleQuality,
+    pub use_fp16: bool,
+
     pub video_src: String,
     pub auto_bgr: bool,
     pub video_bgr: String,
@@ -174,6 +231,11 @@ impl Default for MattingConfig {
             .unwrap_or_else(|| "RemBack_Output".to_owned());
 
         Self {
+            ui_mode: UiMode::Simple,
+            engine_mode: EngineMode::AutoNoRef,
+            simple_quality: SimpleQuality::Balanced,
+            use_fp16: true,
+
             video_src: String::new(),
             auto_bgr: true,
             video_bgr: String::new(),
@@ -282,17 +344,21 @@ impl MattingConfig {
         if self.video_src.trim().is_empty() || !Path::new(&self.video_src).is_file() {
             return Err("Selecciona un archivo de video de origen válido (--video-src).".into());
         }
-        if !self.auto_bgr
-            && (self.video_bgr.trim().is_empty() || !Path::new(&self.video_bgr).is_file())
-        {
-            return Err(
-                "Selecciona una imagen de fondo limpia (--video-bgr), usa 'Extraer Frame 0' o activa 'Sin imagen de referencia (Auto)'.".into(),
-            );
-        }
-        if self.model_checkpoint.trim().is_empty() || !Path::new(&self.model_checkpoint).is_file() {
-            return Err(
-                "Selecciona un modelo (.pth) o descárgalo desde 'Actualizaciones'.".into(),
-            );
+        if self.engine_mode == EngineMode::BgMattingV2 {
+            if !self.auto_bgr
+                && (self.video_bgr.trim().is_empty() || !Path::new(&self.video_bgr).is_file())
+            {
+                return Err(
+                    "Selecciona una imagen de fondo limpia (--video-bgr), usa 'Extraer Frame 0' o activa 'Sin imagen de referencia (Auto)'.".into(),
+                );
+            }
+            if self.model_checkpoint.trim().is_empty()
+                || !Path::new(&self.model_checkpoint).is_file()
+            {
+                return Err(
+                    "Selecciona un modelo (.pth) de BackgroundMattingV2 o descárgalo desde 'Actualizaciones'.".into(),
+                );
+            }
         }
         if self.bg_mode == BgMode::TargetMedia
             && (self.video_target_bgr.trim().is_empty()
@@ -328,10 +394,31 @@ mod tests {
         assert_eq!(cfg.refine_kernel_size, 3);
         assert_eq!(cfg.chroma_color, [120, 255, 155]);
         assert!(cfg.auto_bgr);
+        assert_eq!(cfg.ui_mode, UiMode::Simple);
+        assert_eq!(cfg.engine_mode, EngineMode::AutoNoRef);
+        assert_eq!(cfg.simple_quality, SimpleQuality::Balanced);
+        assert!(cfg.use_fp16);
     }
 
     #[test]
-    fn auto_bgr_skips_missing_video_bgr_validation() {
+    fn detect_backbone_from_checkpoint_filename() {
+        assert_eq!(
+            Backbone::detect_from_path(r"C:\models\pytorch_resnet101.pth"),
+            Some(Backbone::ResNet101)
+        );
+        assert_eq!(
+            Backbone::detect_from_path("pytorch_resnet50.pth"),
+            Some(Backbone::ResNet50)
+        );
+        assert_eq!(
+            Backbone::detect_from_path("torchscript_mobilenetv2_fp16.pth"),
+            Some(Backbone::MobileNetV2)
+        );
+        assert_eq!(Backbone::detect_from_path("custom.pth"), None);
+    }
+
+    #[test]
+    fn auto_noref_validates_without_bgr_or_pth() {
         let tmp_dir = std::env::temp_dir().join("remback_cfg_test");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let vid = tmp_dir.join("dummy.mp4");
@@ -341,9 +428,16 @@ mod tests {
 
         let mut cfg = MattingConfig::default();
         cfg.video_src = vid.to_string_lossy().into_owned();
+        cfg.engine_mode = EngineMode::AutoNoRef;
+        cfg.model_checkpoint.clear();
+        cfg.video_bgr.clear();
+        assert!(cfg.validate(false).is_ok());
+
+        cfg.engine_mode = EngineMode::BgMattingV2;
+        assert!(cfg.validate(false).is_err());
+
         cfg.model_checkpoint = ckpt.to_string_lossy().into_owned();
         cfg.auto_bgr = true;
-        cfg.video_bgr.clear();
         assert!(cfg.validate(false).is_ok());
 
         cfg.auto_bgr = false;

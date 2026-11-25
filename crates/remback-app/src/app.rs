@@ -13,12 +13,13 @@ use remback_ui::{
 };
 
 use crate::config::{
-    Backbone, BgMode, ComputeDevice, MattingConfig, ModelType, OutputFormat, OutputLayer,
-    RefineMode,
+    Backbone, BgMode, ComputeDevice, EngineMode, MattingConfig, ModelType, OutputFormat,
+    OutputLayer, RefineMode, SimpleQuality, UiMode,
 };
 use crate::updater::{
-    check_bgmv2_updates, download_model_asset, setup_python_environment, update_bgmv2_repo,
-    Bgmv2InstalledState, ModelAssetInfo, RemoteBgmv2Info, UpdaterEvent, UpdaterPaths,
+    check_bgmv2_updates, download_and_launch_app_update, download_model_asset, is_newer_version,
+    setup_python_environment, update_bgmv2_repo, Bgmv2InstalledState, ModelAssetInfo,
+    RemoteAppRelease, RemoteBgmv2Info, UpdaterEvent, UpdaterPaths,
 };
 use crate::worker::{
     run_export, run_extract_frame, run_preview, run_probe_video, VideoInfo, WorkerEvent,
@@ -75,6 +76,8 @@ pub struct RemBackApp {
     // Updater & Environment state
     installed_state: Bgmv2InstalledState,
     remote_info: Option<RemoteBgmv2Info>,
+    remote_app_release: Option<RemoteAppRelease>,
+    app_update_available: bool,
     update_available: bool,
     checking_updates: bool,
     updater_rx: Option<Receiver<UpdaterEvent>>,
@@ -134,6 +137,8 @@ impl RemBackApp {
             worker: None,
             installed_state,
             remote_info: None,
+            remote_app_release: None,
+            app_update_available: false,
             update_available: false,
             checking_updates: true,
             updater_rx,
@@ -306,20 +311,32 @@ impl RemBackApp {
                 UpdaterEvent::CheckFinished(res) => {
                     self.checking_updates = false;
                     finish = true;
-                    match res {
-                        Ok(remote) => {
-                            let outdated = !self.paths.is_bgmv2_installed()
-                                || (!self.installed_state.commit_sha.is_empty()
-                                    && self.installed_state.commit_sha != remote.commit_sha);
-                            self.update_available = outdated;
-                            self.remote_info = Some(remote);
-                        }
-                        Err(err) => {
-                            if self.show_updates_modal {
-                                self.push_toast(ctx, err, true);
-                            }
+                    if let Some(app_rel) = res.app_release {
+                        self.app_update_available = is_newer_version(APP_VERSION, &app_rel.version);
+                        self.remote_app_release = Some(app_rel);
+                    }
+                    if let Some(remote) = res.bgmv2 {
+                        let outdated = !self.paths.is_bgmv2_installed()
+                            || (!self.installed_state.commit_sha.is_empty()
+                                && self.installed_state.commit_sha != remote.commit_sha);
+                        self.update_available = outdated;
+                        self.remote_info = Some(remote);
+                    } else if let Some(err) = res.bgmv2_error {
+                        if self.show_updates_modal {
+                            self.push_toast(ctx, err, true);
                         }
                     }
+                }
+                UpdaterEvent::AppUpdateReadyToExit => {
+                    self.updater_busy = false;
+                    finish = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                UpdaterEvent::AppUpdateError(err) => {
+                    self.updater_busy = false;
+                    finish = true;
+                    self.updater_status = err.clone();
+                    self.push_toast(ctx, err, true);
                 }
                 UpdaterEvent::Bgmv2Updated(res) => {
                     self.updater_busy = false;
@@ -391,7 +408,18 @@ impl RemBackApp {
     }
 
     fn engine_ready(&self) -> bool {
-        self.paths.is_bgmv2_installed() && self.paths.is_venv_ready()
+        match self.config.engine_mode {
+            EngineMode::AutoNoRef => self.paths.is_venv_ready(),
+            EngineMode::BgMattingV2 => {
+                self.paths.is_bgmv2_installed() && self.paths.is_venv_ready()
+            }
+        }
+    }
+
+    fn sync_backbone_from_checkpoint(&mut self) {
+        if let Some(detected) = Backbone::detect_from_path(&self.config.model_checkpoint) {
+            self.config.model_backbone = detected;
+        }
     }
 
     fn start_probe_video(&mut self, ctx: &egui::Context) {
@@ -550,7 +578,10 @@ impl RemBackApp {
                             self.show_about_modal = true;
                         }
 
-                        let upd_label = if self.update_available || !self.engine_ready() {
+                        let upd_label = if self.app_update_available
+                            || self.update_available
+                            || !self.engine_ready()
+                        {
                             "● Actualizaciones"
                         } else {
                             "Actualizaciones"
@@ -560,10 +591,33 @@ impl RemBackApp {
                             ui,
                             &upd_resp,
                             "Actualizador y Entorno",
-                            "Busca actualizaciones de BackgroundMattingV2 en GitHub, configura PyTorch/CUDA y descarga los modelos (.pth).",
+                            "Busca actualizaciones de RemBack y BackgroundMattingV2 en GitHub, configura PyTorch/CUDA y descarga los modelos.",
                         );
                         if upd_resp.clicked() {
                             self.show_updates_modal = true;
+                        }
+
+                        if self.app_update_available {
+                            if let Some(rel) = self.remote_app_release.clone() {
+                                let app_upd_btn = primary_button(
+                                    ui,
+                                    &format!("⬆ Actualizar v{}", rel.version),
+                                    !self.updater_busy,
+                                );
+                                smooth_tooltip(
+                                    ui,
+                                    &app_upd_btn,
+                                    "Nueva versión de RemBack disponible",
+                                    "Descarga e instala la actualización automáticamente desde GitHub.",
+                                );
+                                if app_upd_btn.clicked() {
+                                    self.show_updates_modal = true;
+                                    self.updater_busy = true;
+                                    self.updater_progress = 0.03;
+                                    self.updater_logs.clear();
+                                    self.updater_rx = Some(download_and_launch_app_update(rel));
+                                }
+                            }
                         }
 
                         if self.engine_ready() {
@@ -595,314 +649,515 @@ impl RemBackApp {
             });
     }
 
+    fn render_video_src_and_bg_target(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        ui.label(
+            RichText::new("Video de origen")
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+        );
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.config.video_src)
+                    .desired_width(ui.available_width() - 88.0)
+                    .hint_text("Selecciona un video (.mp4, .mov...)"),
+            );
+            smooth_tooltip(
+                ui,
+                &edit,
+                "Video de origen (--video-src)",
+                "Archivo de video con el sujeto cuyo fondo deseas extraer o reemplazar.",
+            );
+            let btn = secondary_button(ui, "Elegir...", true);
+            smooth_tooltip(
+                ui,
+                &btn,
+                "Seleccionar video",
+                "Abre el explorador para elegir el video principal.",
+            );
+            if btn.clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mov", "avi", "mkv", "webm"])
+                    .pick_file()
+                {
+                    self.config.video_src = p.to_string_lossy().into_owned();
+                    self.config.save();
+                    self.start_probe_video(ctx);
+                }
+            }
+        });
+
+        if let Some(info) = &self.video_info {
+            ui.label(
+                RichText::new(format!(
+                    "{}x{} · {:.1} fps · {} fotogramas",
+                    info.width, info.height, info.fps, info.frame_count
+                ))
+                .size(11.0)
+                .color(Palette::CYAN),
+            );
+        }
+    }
+
+    fn render_replacement_and_output_dir(&mut self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Modo de reemplazo")
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+        );
+        let bg_seg = segmented_control(
+            ui,
+            "bg_mode_seg",
+            &mut self.config.bg_mode,
+            &[
+                (BgMode::GreenScreen, "Verde"),
+                (BgMode::Transparent, "Sin fondo"),
+                (BgMode::CustomColor, "Color"),
+                (BgMode::TargetMedia, "Media"),
+            ],
+        );
+        smooth_tooltip(
+            ui,
+            &bg_seg,
+            "Fondo de salida",
+            "Verde: pantalla verde clásica (#78FF9B).\nSin fondo: transparencia alpha (PNG RGBA).\nColor: color sólido personalizado.\nMedia: video o imagen (--video-target-bgr).",
+        );
+
+        match self.config.bg_mode {
+            BgMode::GreenScreen => {
+                ui.label(
+                    RichText::new("Pantalla verde estándar RGB(120, 255, 155)")
+                        .size(11.0)
+                        .color(Palette::TEXT_MUTED),
+                );
+            }
+            BgMode::Transparent => {
+                ui.label(
+                    RichText::new("Exportará secuencia PNG RGBA con canal alpha real.")
+                        .size(11.0)
+                        .color(Palette::EMERALD_BRIGHT),
+                );
+            }
+            BgMode::CustomColor => {
+                ui.horizontal(|ui| {
+                    ui.label("Color sólido:");
+                    ui.color_edit_button_srgb(&mut self.config.chroma_color);
+                });
+            }
+            BgMode::TargetMedia => {
+                ui.horizontal(|ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.config.video_target_bgr)
+                            .desired_width(ui.available_width() - 88.0)
+                            .hint_text("Video o imagen de nuevo fondo"),
+                    );
+                    smooth_tooltip(
+                        ui,
+                        &edit,
+                        "Fondo destino (--video-target-bgr)",
+                        "Video o imagen sobre el cual se compondrá el sujeto extraído.",
+                    );
+                    let btn = secondary_button(ui, "Elegir...", true);
+                    if btn.clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Media", &["mp4", "mov", "avi", "png", "jpg", "jpeg"])
+                            .pick_file()
+                        {
+                            self.config.video_target_bgr = p.to_string_lossy().into_owned();
+                            self.config.save();
+                        }
+                    }
+                });
+            }
+        }
+
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Carpeta de salida")
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+        );
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.config.output_dir)
+                    .desired_width(ui.available_width() - 88.0),
+            );
+            smooth_tooltip(
+                ui,
+                &edit,
+                "Directorio de salida (--output-dir)",
+                "Carpeta donde se guardarán los videos o secuencias exportadas.",
+            );
+            let btn = secondary_button(ui, "Elegir...", true);
+            if btn.clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.config.output_dir = p.to_string_lossy().into_owned();
+                    self.config.save();
+                }
+            }
+        });
+    }
+
+    fn render_bgmv2_bgr_picker(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        ui.label(
+            RichText::new("Fondo limpio (referencia)")
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+        );
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.config.video_bgr)
+                    .desired_width(ui.available_width() - 88.0)
+                    .hint_text("Imagen de fondo sin el sujeto"),
+            );
+            smooth_tooltip(
+                ui,
+                &edit,
+                "Fondo estático (--video-bgr)",
+                "Foto del mismo escenario sin la persona/sujeto para lograr precisión milimétrica.",
+            );
+            let btn = secondary_button(ui, "Elegir...", true);
+            if btn.clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Imagen", &["png", "jpg", "jpeg", "bmp", "webp"])
+                    .pick_file()
+                {
+                    self.config.video_bgr = p.to_string_lossy().into_owned();
+                    self.config.save();
+                }
+            }
+        });
+
+        let extract_btn =
+            secondary_button(ui, "Extraer Frame 0 del video", !self.config.video_src.is_empty());
+        smooth_tooltip(
+            ui,
+            &extract_btn,
+            "Extraer primer fotograma",
+            "Extrae automáticamente el fotograma 0 del video por si el inicio está limpio sin el sujeto.",
+        );
+        if extract_btn.clicked() {
+            self.start_extract_frame0(ctx);
+        }
+    }
+
+    fn render_checkpoint_picker(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Checkpoint (.pth)")
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+        );
+        if !self.local_models.is_empty() {
+            let current_name = Path::new(&self.config.model_checkpoint)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Elegir descargado...".into());
+            let mut changed_ckpt = false;
+            egui::ComboBox::from_id_salt("local_model_combo")
+                .width(ui.available_width())
+                .selected_text(current_name)
+                .show_ui(ui, |ui| {
+                    for m in &self.local_models {
+                        let m_str = m.to_string_lossy().into_owned();
+                        let label = m
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| m_str.clone());
+                        if ui
+                            .selectable_value(&mut self.config.model_checkpoint, m_str, label)
+                            .changed()
+                        {
+                            changed_ckpt = true;
+                        }
+                    }
+                });
+            if changed_ckpt {
+                self.sync_backbone_from_checkpoint();
+                self.config.save();
+            }
+        }
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.config.model_checkpoint)
+                    .desired_width(ui.available_width() - 88.0)
+                    .hint_text("Ruta al archivo .pth"),
+            );
+            smooth_tooltip(
+                ui,
+                &edit,
+                "Pesos del modelo (--model-checkpoint)",
+                "Archivo .pth preentrenado de BackgroundMattingV2. Puedes descargarlos con 1 clic en Actualizaciones.",
+            );
+            let btn = secondary_button(ui, "Buscar...", true);
+            if btn.clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("PyTorch Checkpoint", &["pth", "pt"])
+                    .pick_file()
+                {
+                    self.config.model_checkpoint = p.to_string_lossy().into_owned();
+                    self.sync_backbone_from_checkpoint();
+                    self.config.save();
+                }
+            }
+        });
+    }
+
     fn render_left_sidebar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
 
-                // 1. Archivos y Fondo
-                glass_card(ui, "card_files", "Archivos y Fondo", None, |ui| {
-                    // Video src
-                    ui.label(RichText::new("Video de origen").size(12.5).color(Palette::TEXT_SECONDARY));
-                    ui.horizontal(|ui| {
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.config.video_src)
-                                .desired_width(ui.available_width() - 88.0)
-                                .hint_text("Selecciona un video (.mp4, .mov...)"),
-                        );
-                        smooth_tooltip(
-                            ui,
-                            &edit,
-                            "Video de origen (--video-src)",
-                            "Archivo de video con el sujeto cuyo fondo deseas extraer o reemplazar.",
-                        );
-                        let btn = secondary_button(ui, "Elegir...", true);
-                        smooth_tooltip(
-                            ui,
-                            &btn,
-                            "Seleccionar video",
-                            "Abre el explorador para elegir el video principal.",
-                        );
-                        if btn.clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Video", &["mp4", "mov", "avi", "mkv", "webm"])
-                                .pick_file()
-                            {
-                                self.config.video_src = p.to_string_lossy().into_owned();
-                                self.config.save();
-                                self.start_probe_video(ctx);
-                            }
-                        }
+                // Mode Switcher: Simple vs Avanzado
+                let mode_seg = segmented_control(
+                    ui,
+                    "ui_mode_seg",
+                    &mut self.config.ui_mode,
+                    &[
+                        (UiMode::Simple, "Modo Simple"),
+                        (UiMode::Advanced, "Modo Avanzado"),
+                    ],
+                );
+                if mode_seg.changed() {
+                    self.config.save();
+                }
+                smooth_tooltip(
+                    ui,
+                    &mode_seg,
+                    "Nivel de controles",
+                    "Modo Simple usa ajustes óptimos listos para casi cualquier video.\nModo Avanzado expone todos los parámetros técnicos de BackgroundMattingV2 y RVM.",
+                );
+
+                if self.config.ui_mode == UiMode::Simple {
+                    glass_card(ui, "card_simple_files", "1. Video y Fondo", None, |ui| {
+                        self.render_video_src_and_bg_target(ui, ctx);
+                        self.render_replacement_and_output_dir(ui);
                     });
 
-                    if let Some(info) = &self.video_info {
-                        ui.label(
-                            RichText::new(format!(
-                                "{}x{} · {:.1} fps · {} fotogramas",
-                                info.width, info.height, info.fps, info.frame_count
-                            ))
-                            .size(11.0)
-                            .color(Palette::CYAN),
+                    glass_card(ui, "card_simple_quality", "2. Calidad y Velocidad", Some("Auto"), |ui| {
+                        let mut use_ref = self.config.engine_mode == EngineMode::BgMattingV2;
+                        let ref_tog = smooth_toggle(
+                            ui,
+                            &mut use_ref,
+                            "Tengo foto del fondo vacío (BackgroundMattingV2)",
                         );
-                    }
+                        if ref_tog.changed() {
+                            self.config.engine_mode = if use_ref {
+                                self.config.auto_bgr = false;
+                                EngineMode::BgMattingV2
+                            } else {
+                                EngineMode::AutoNoRef
+                            };
+                            self.config.save();
+                        }
+                        smooth_tooltip(
+                            ui,
+                            &ref_tog,
+                            "Elegir motor según material",
+                            "Desactivado (recomendado): recorta automáticamente sin foto previa del fondo.\nActivado: usa BackgroundMattingV2 con tu fotografía limpia del escenario.",
+                        );
+
+                        if self.config.engine_mode == EngineMode::AutoNoRef {
+                            ui.label(
+                                RichText::new("Modo automático sin foto previa · rápido y preciso.")
+                                    .size(11.5)
+                                    .color(Palette::EMERALD_BRIGHT),
+                            );
+                            ui.label(
+                                RichText::new("Perfil de calidad")
+                                    .size(12.5)
+                                    .color(Palette::TEXT_SECONDARY),
+                            );
+                            let q_seg = segmented_control(
+                                ui,
+                                "simple_q_seg",
+                                &mut self.config.simple_quality,
+                                &[
+                                    (SimpleQuality::Balanced, "Alta Calidad (ResNet50)"),
+                                    (SimpleQuality::Fast, "Ultra Rápido (MobileNetV3)"),
+                                ],
+                            );
+                            if q_seg.changed() {
+                                self.config.save();
+                            }
+                            smooth_tooltip(
+                                ui,
+                                &q_seg,
+                                "Calidad vs Velocidad",
+                                "Alta Calidad ofrece bordes y cabello excelentes.\nUltra Rápido procesa a máxima velocidad con menor uso de VRAM.",
+                            );
+                        } else {
+                            self.render_bgmv2_bgr_picker(ui, ctx);
+                            self.render_checkpoint_picker(ui);
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Dispositivo de cómputo")
+                                .size(12.5)
+                                .color(Palette::TEXT_SECONDARY),
+                        );
+                        let dev_seg = segmented_control(
+                            ui,
+                            "simple_dev_seg",
+                            &mut self.config.device,
+                            &[
+                                (ComputeDevice::Cuda, "CUDA (GPU)"),
+                                (ComputeDevice::Cpu, "CPU"),
+                            ],
+                        );
+                        if dev_seg.changed() {
+                            self.config.save();
+                        }
+                        smooth_tooltip(
+                            ui,
+                            &dev_seg,
+                            "Aceleración por hardware",
+                            "CUDA usa tu tarjeta gráfica NVIDIA para procesar mucho más rápido (FP16 automático).",
+                        );
+                    });
+                    return;
+                }
+
+                // ---------------- MODO AVANZADO ----------------
+
+                // 1. Archivos y Fondo
+                glass_card(ui, "card_files", "Archivos y Fondo", None, |ui| {
+                    self.render_video_src_and_bg_target(ui, ctx);
 
                     ui.add_space(4.0);
-                    let auto_tog = smooth_toggle(
-                        ui,
-                        &mut self.config.auto_bgr,
-                        "Sin imagen de referencia (Auto)",
+                    ui.label(
+                        RichText::new("Motor neuronal")
+                            .size(12.5)
+                            .color(Palette::TEXT_SECONDARY),
                     );
-                    if auto_tog.changed() {
+                    let eng_seg = segmented_control(
+                        ui,
+                        "adv_engine_seg",
+                        &mut self.config.engine_mode,
+                        &[
+                            (EngineMode::AutoNoRef, "Auto sin fondo (RVM)"),
+                            (EngineMode::BgMattingV2, "BackgroundMattingV2"),
+                        ],
+                    );
+                    if eng_seg.changed() {
                         self.config.save();
                     }
                     smooth_tooltip(
                         ui,
-                        &auto_tog,
-                        "Fondo automático sin frame de referencia",
-                        "BackgroundMattingV2 requiere originalmente una foto vacía del escenario (--video-bgr). Al activar esta opción, RemBack muestrea el video, segmenta al sujeto y reconstruye el fondo limpio automáticamente.",
+                        &eng_seg,
+                        "Motor de segmentación",
+                        "Auto sin fondo (RVM): red recurrente TorchScript que no necesita imagen de fondo.\nBackgroundMattingV2: usa foto limpia del fondo o reconstrucción temporal.",
                     );
 
-                    if self.config.auto_bgr {
-                        ui.label(
-                            RichText::new("Se reconstruirá el fondo limpio automáticamente desde el video.")
-                                .size(11.0)
-                                .color(Palette::EMERALD_BRIGHT),
+                    if self.config.engine_mode == EngineMode::BgMattingV2 {
+                        ui.add_space(4.0);
+                        let auto_tog = smooth_toggle(
+                            ui,
+                            &mut self.config.auto_bgr,
+                            "Sin imagen de referencia (Reconstrucción Auto)",
                         );
-                    } else {
-                        ui.label(RichText::new("Fondo limpio (referencia)").size(12.5).color(Palette::TEXT_SECONDARY));
-                        ui.horizontal(|ui| {
-                            let edit = ui.add(
-                                egui::TextEdit::singleline(&mut self.config.video_bgr)
-                                    .desired_width(ui.available_width() - 88.0)
-                                    .hint_text("Imagen de fondo sin el sujeto"),
-                            );
-                            smooth_tooltip(
-                                ui,
-                                &edit,
-                                "Fondo estático (--video-bgr)",
-                                "Foto del mismo escenario sin la persona/sujeto para lograr precisión milimétrica.",
-                            );
-                            let btn = secondary_button(ui, "Elegir...", true);
-                            if btn.clicked() {
-                                if let Some(p) = rfd::FileDialog::new()
-                                    .add_filter("Imagen", &["png", "jpg", "jpeg", "bmp", "webp"])
-                                    .pick_file()
-                                {
-                                    self.config.video_bgr = p.to_string_lossy().into_owned();
-                                    self.config.save();
-                                }
-                            }
-                        });
-
-                        let extract_btn = secondary_button(ui, "Extraer Frame 0 del video", !self.config.video_src.is_empty());
+                        if auto_tog.changed() {
+                            self.config.save();
+                        }
                         smooth_tooltip(
                             ui,
-                            &extract_btn,
-                            "Extraer primer fotograma",
-                            "Extrae automáticamente el fotograma 0 del video por si el inicio está limpio sin el sujeto.",
+                            &auto_tog,
+                            "Fondo automático en BackgroundMattingV2",
+                            "Reconstruye el fondo limpio mediante muestreo y segmentación temporal cuando no tienes foto vacía.",
                         );
-                        if extract_btn.clicked() {
-                            self.start_extract_frame0(ctx);
-                        }
-                    }
 
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Modo de reemplazo").size(12.5).color(Palette::TEXT_SECONDARY));
-                    let bg_seg = segmented_control(
-                        ui,
-                        "bg_mode_seg",
-                        &mut self.config.bg_mode,
-                        &[
-                            (BgMode::GreenScreen, "Verde"),
-                            (BgMode::Transparent, "Sin fondo"),
-                            (BgMode::CustomColor, "Color"),
-                            (BgMode::TargetMedia, "Media"),
-                        ],
-                    );
-                    smooth_tooltip(
-                        ui,
-                        &bg_seg,
-                        "Fondo de salida",
-                        "Verde: pantalla verde clásica (#78FF9B).\nSin fondo: transparencia alpha (PNG RGBA).\nColor: color sólido personalizado.\nMedia: video o imagen (--video-target-bgr).",
-                    );
-
-                    match self.config.bg_mode {
-                        BgMode::GreenScreen => {
+                        if self.config.auto_bgr {
                             ui.label(
-                                RichText::new("Pantalla verde estándar RGB(120, 255, 155)")
-                                    .size(11.0)
-                                    .color(Palette::TEXT_MUTED),
-                            );
-                        }
-                        BgMode::Transparent => {
-                            ui.label(
-                                RichText::new("Exportará secuencia PNG RGBA con canal alpha real.")
+                                RichText::new("Se reconstruirá el fondo limpio automáticamente desde el video.")
                                     .size(11.0)
                                     .color(Palette::EMERALD_BRIGHT),
                             );
-                        }
-                        BgMode::CustomColor => {
-                            ui.horizontal(|ui| {
-                                ui.label("Color sólido:");
-                                ui.color_edit_button_srgb(&mut self.config.chroma_color);
-                            });
-                        }
-                        BgMode::TargetMedia => {
-                            ui.horizontal(|ui| {
-                                let edit = ui.add(
-                                    egui::TextEdit::singleline(&mut self.config.video_target_bgr)
-                                        .desired_width(ui.available_width() - 88.0)
-                                        .hint_text("Video o imagen de nuevo fondo"),
-                                );
-                                smooth_tooltip(
-                                    ui,
-                                    &edit,
-                                    "Fondo destino (--video-target-bgr)",
-                                    "Video o imagen sobre el cual se compondrá el sujeto extraído.",
-                                );
-                                let btn = secondary_button(ui, "Elegir...", true);
-                                if btn.clicked() {
-                                    if let Some(p) = rfd::FileDialog::new()
-                                        .add_filter("Media", &["mp4", "mov", "avi", "png", "jpg", "jpeg"])
-                                        .pick_file()
-                                    {
-                                        self.config.video_target_bgr = p.to_string_lossy().into_owned();
-                                        self.config.save();
-                                    }
-                                }
-                            });
+                        } else {
+                            self.render_bgmv2_bgr_picker(ui, ctx);
                         }
                     }
 
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Carpeta de salida").size(12.5).color(Palette::TEXT_SECONDARY));
-                    ui.horizontal(|ui| {
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.config.output_dir)
-                                .desired_width(ui.available_width() - 88.0),
-                        );
-                        smooth_tooltip(
-                            ui,
-                            &edit,
-                            "Directorio de salida (--output-dir)",
-                            "Carpeta donde se guardarán los videos o secuencias exportadas.",
-                        );
-                        let btn = secondary_button(ui, "Elegir...", true);
-                        if btn.clicked() {
-                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                self.config.output_dir = p.to_string_lossy().into_owned();
-                                self.config.save();
-                            }
-                        }
-                    });
+                    self.render_replacement_and_output_dir(ui);
                 });
 
                 // 2. Modelo y Hardware
                 glass_card(ui, "card_model", "Modelo y Hardware", None, |ui| {
-                    ui.label(RichText::new("Tipo de modelo").size(12.5).color(Palette::TEXT_SECONDARY));
-                    let mt_seg = segmented_control(
-                        ui,
-                        "model_type_seg",
-                        &mut self.config.model_type,
-                        &[
-                            (ModelType::MattingRefine, "MattingRefine (HD/4K)"),
-                            (ModelType::MattingBase, "MattingBase (Rápido)"),
-                        ],
-                    );
-                    smooth_tooltip(
-                        ui,
-                        &mt_seg,
-                        "Tipo de red (--model-type)",
-                        "MattingRefine añade refinamiento de alta resolución en bordes y cabello. MattingBase solo ejecuta la red base.",
-                    );
+                    if self.config.engine_mode == EngineMode::AutoNoRef {
+                        ui.label(
+                            RichText::new("Arquitectura RVM")
+                                .size(12.5)
+                                .color(Palette::TEXT_SECONDARY),
+                        );
+                        let q_seg = segmented_control(
+                            ui,
+                            "adv_rvm_q_seg",
+                            &mut self.config.simple_quality,
+                            &[
+                                (SimpleQuality::Balanced, "ResNet50 (Alta Calidad)"),
+                                (SimpleQuality::Fast, "MobileNetV3 (Rápido)"),
+                            ],
+                        );
+                        smooth_tooltip(
+                            ui,
+                            &q_seg,
+                            "Modelo TorchScript RVM",
+                            "ResNet50 logra máxima precisión en bordes complejos; MobileNetV3 maximiza FPS.",
+                        );
+                    } else {
+                        ui.label(RichText::new("Tipo de modelo").size(12.5).color(Palette::TEXT_SECONDARY));
+                        let mt_seg = segmented_control(
+                            ui,
+                            "model_type_seg",
+                            &mut self.config.model_type,
+                            &[
+                                (ModelType::MattingRefine, "MattingRefine (HD/4K)"),
+                                (ModelType::MattingBase, "MattingBase (Rápido)"),
+                            ],
+                        );
+                        smooth_tooltip(
+                            ui,
+                            &mt_seg,
+                            "Tipo de red (--model-type)",
+                            "MattingRefine añade refinamiento de alta resolución en bordes y cabello. MattingBase solo ejecuta la red base.",
+                        );
 
-                    ui.label(RichText::new("Backbone").size(12.5).color(Palette::TEXT_SECONDARY));
-                    let bb_seg = segmented_control(
-                        ui,
-                        "backbone_seg",
-                        &mut self.config.model_backbone,
-                        &[
-                            (Backbone::MobileNetV2, "MobileNetV2"),
-                            (Backbone::ResNet50, "ResNet50"),
-                            (Backbone::ResNet101, "ResNet101"),
-                        ],
-                    );
-                    smooth_tooltip(
-                        ui,
-                        &bb_seg,
-                        "Arquitectura (--model-backbone)",
-                        "MobileNetV2 es muy rápido; ResNet50 ofrece el mejor balance; ResNet101 da máxima fidelidad. Debe coincidir con el checkpoint .pth.",
-                    );
+                        ui.label(RichText::new("Backbone").size(12.5).color(Palette::TEXT_SECONDARY));
+                        let bb_seg = segmented_control(
+                            ui,
+                            "backbone_seg",
+                            &mut self.config.model_backbone,
+                            &[
+                                (Backbone::MobileNetV2, "MobileNetV2"),
+                                (Backbone::ResNet50, "ResNet50"),
+                                (Backbone::ResNet101, "ResNet101"),
+                            ],
+                        );
+                        smooth_tooltip(
+                            ui,
+                            &bb_seg,
+                            "Arquitectura (--model-backbone)",
+                            "MobileNetV2 es muy rápido; ResNet50 ofrece el mejor balance; ResNet101 da máxima fidelidad. Se sincroniza automáticamente al elegir un .pth.",
+                        );
 
-                    ui.label(RichText::new("Checkpoint (.pth)").size(12.5).color(Palette::TEXT_SECONDARY));
-                    if !self.local_models.is_empty() {
-                        let current_name = Path::new(&self.config.model_checkpoint)
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "Elegir descargado...".into());
-                        egui::ComboBox::from_id_salt("local_model_combo")
-                            .width(ui.available_width())
-                            .selected_text(current_name)
-                            .show_ui(ui, |ui| {
-                                for m in &self.local_models {
-                                    let m_str = m.to_string_lossy().into_owned();
-                                    let label = m
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| m_str.clone());
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.config.model_checkpoint,
-                                            m_str,
-                                            label,
-                                        )
-                                        .changed()
-                                    {
-                                        self.config.save();
-                                    }
-                                }
-                            });
+                        self.render_checkpoint_picker(ui);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Escala backbone:").size(12.5).color(Palette::TEXT_SECONDARY));
+                            let sl = smooth_slider(
+                                ui,
+                                &mut self.config.model_backbone_scale,
+                                0.125..=1.0,
+                                "x",
+                            );
+                            smooth_tooltip(
+                                ui,
+                                &sl,
+                                "Escala del backbone (--model-backbone-scale)",
+                                "Factor de resolución de la pasada base (0.25 recomendado para 1080p, 0.125 para 4K). Menor = más rápido.",
+                            );
+                        });
                     }
-                    ui.horizontal(|ui| {
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.config.model_checkpoint)
-                                .desired_width(ui.available_width() - 88.0)
-                                .hint_text("Ruta al archivo .pth"),
-                        );
-                        smooth_tooltip(
-                            ui,
-                            &edit,
-                            "Pesos del modelo (--model-checkpoint)",
-                            "Archivo .pth preentrenado de BackgroundMattingV2. Puedes descargarlos con 1 clic en Actualizaciones.",
-                        );
-                        let btn = secondary_button(ui, "Buscar...", true);
-                        if btn.clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("PyTorch Checkpoint", &["pth", "pt"])
-                                .pick_file()
-                            {
-                                self.config.model_checkpoint = p.to_string_lossy().into_owned();
-                                self.config.save();
-                            }
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Escala backbone:").size(12.5).color(Palette::TEXT_SECONDARY));
-                        let sl = smooth_slider(
-                            ui,
-                            &mut self.config.model_backbone_scale,
-                            0.125..=1.0,
-                            "x",
-                        );
-                        smooth_tooltip(
-                            ui,
-                            &sl,
-                            "Escala del backbone (--model-backbone-scale)",
-                            "Factor de resolución de la pasada base (0.25 recomendado para 1080p, 0.125 para 4K). Menor = más rápido.",
-                        );
-                    });
 
                     ui.label(RichText::new("Dispositivo de cómputo").size(12.5).color(Palette::TEXT_SECONDARY));
                     let dev_seg = segmented_control(
@@ -921,17 +1176,31 @@ impl RemBackApp {
                         "CUDA aprovecha tu GPU NVIDIA para procesar decenas de veces más rápido que CPU.",
                     );
 
-                    let align_tog = smooth_toggle(
+                    let fp16_tog = smooth_toggle(
                         ui,
-                        &mut self.config.preprocess_alignment,
-                        "Alineación homográfica (cámara en mano)",
+                        &mut self.config.use_fp16,
+                        "Precisión FP16 en GPU (2x más rápido)",
                     );
                     smooth_tooltip(
                         ui,
-                        &align_tog,
-                        "Preprocesado (--preprocess-alignment)",
-                        "Alinea el fondo con la toma si la cámara tiene ligeros movimientos o vibraciones respecto a la foto limpia.",
+                        &fp16_tog,
+                        "Aceleración media precisión (FP16)",
+                        "Ejecuta la inferencia en float16 sobre GPU CUDA, reduciendo a la mitad el uso de VRAM y duplicando la velocidad sin pérdida visual.",
                     );
+
+                    if self.config.engine_mode == EngineMode::BgMattingV2 {
+                        let align_tog = smooth_toggle(
+                            ui,
+                            &mut self.config.preprocess_alignment,
+                            "Alineación homográfica (cámara en mano)",
+                        );
+                        smooth_tooltip(
+                            ui,
+                            &align_tog,
+                            "Preprocesado (--preprocess-alignment)",
+                            "Alinea el fondo con la toma si la cámara tiene ligeros movimientos o vibraciones respecto a la foto limpia.",
+                        );
+                    }
 
                     let res_tog = smooth_toggle(
                         ui,
@@ -974,97 +1243,100 @@ impl RemBackApp {
                     }
                 });
 
-                // 3. Refinamiento (solo MattingRefine)
-                let is_refine = self.config.model_type == ModelType::MattingRefine;
-                glass_card(
-                    ui,
-                    "card_refine",
-                    "Refinamiento",
-                    Some(if is_refine { "Activo" } else { "Solo Refine" }),
-                    |ui| {
-                        ui.add_enabled_ui(is_refine, |ui| {
-                            ui.label(
-                                RichText::new("Modo de refinamiento")
-                                    .size(12.5)
-                                    .color(Palette::TEXT_SECONDARY),
-                            );
-                            let rm_seg = segmented_control(
-                                ui,
-                                "refine_mode_seg",
-                                &mut self.config.refine_mode,
-                                &[
-                                    (RefineMode::Sampling, "Sampling"),
-                                    (RefineMode::Thresholding, "Threshold"),
-                                    (RefineMode::Full, "Full"),
-                                ],
-                            );
-                            smooth_tooltip(
-                                ui,
-                                &rm_seg,
-                                "Modo (--model-refine-mode)",
-                                "Sampling: refina los N píxeles con mayor error.\nThresholding: refina píxeles por encima del umbral.\nFull: refina toda la imagen (más lento).",
-                            );
+                // 3. Refinamiento (solo BackgroundMattingV2 + MattingRefine)
+                let is_refine = self.config.engine_mode == EngineMode::BgMattingV2
+                    && self.config.model_type == ModelType::MattingRefine;
+                if self.config.engine_mode == EngineMode::BgMattingV2 {
+                    glass_card(
+                        ui,
+                        "card_refine",
+                        "Refinamiento",
+                        Some(if is_refine { "Activo" } else { "Solo Refine" }),
+                        |ui| {
+                            ui.add_enabled_ui(is_refine, |ui| {
+                                ui.label(
+                                    RichText::new("Modo de refinamiento")
+                                        .size(12.5)
+                                        .color(Palette::TEXT_SECONDARY),
+                                );
+                                let rm_seg = segmented_control(
+                                    ui,
+                                    "refine_mode_seg",
+                                    &mut self.config.refine_mode,
+                                    &[
+                                        (RefineMode::Sampling, "Sampling"),
+                                        (RefineMode::Thresholding, "Threshold"),
+                                        (RefineMode::Full, "Full"),
+                                    ],
+                                );
+                                smooth_tooltip(
+                                    ui,
+                                    &rm_seg,
+                                    "Modo (--model-refine-mode)",
+                                    "Sampling: refina los N píxeles con mayor error.\nThresholding: refina píxeles por encima del umbral.\nFull: refina toda la imagen (más lento).",
+                                );
 
-                            match self.config.refine_mode {
-                                RefineMode::Sampling => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Píxeles:");
-                                        let sl = smooth_slider(
-                                            ui,
-                                            &mut self.config.refine_sample_pixels,
-                                            10_000..=300_000,
-                                            " px",
+                                match self.config.refine_mode {
+                                    RefineMode::Sampling => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Píxeles:");
+                                            let sl = smooth_slider(
+                                                ui,
+                                                &mut self.config.refine_sample_pixels,
+                                                10_000..=300_000,
+                                                " px",
+                                            );
+                                            smooth_tooltip(
+                                                ui,
+                                                &sl,
+                                                "Píxeles muestreados (--model-refine-sample-pixels)",
+                                                "Cantidad de parches de alta resolución refinados por frame (80,000 recomendado).",
+                                            );
+                                        });
+                                    }
+                                    RefineMode::Thresholding => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Umbral:");
+                                            let sl = smooth_slider(
+                                                ui,
+                                                &mut self.config.refine_threshold,
+                                                0.05..=0.95,
+                                                "",
+                                            );
+                                            smooth_tooltip(
+                                                ui,
+                                                &sl,
+                                                "Umbral de error (--model-refine-threshold)",
+                                                "Sensibilidad para seleccionar regiones a refinar (0.7 por defecto).",
+                                            );
+                                        });
+                                    }
+                                    RefineMode::Full => {
+                                        ui.label(
+                                            RichText::new("Refina el 100% de la resolución.")
+                                                .size(11.5)
+                                                .color(Palette::TEXT_MUTED),
                                         );
-                                        smooth_tooltip(
-                                            ui,
-                                            &sl,
-                                            "Píxeles muestreados (--model-refine-sample-pixels)",
-                                            "Cantidad de parches de alta resolución refinados por frame (80,000 recomendado).",
-                                        );
-                                    });
+                                    }
                                 }
-                                RefineMode::Thresholding => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Umbral:");
-                                        let sl = smooth_slider(
-                                            ui,
-                                            &mut self.config.refine_threshold,
-                                            0.05..=0.95,
-                                            "",
-                                        );
-                                        smooth_tooltip(
-                                            ui,
-                                            &sl,
-                                            "Umbral de error (--model-refine-threshold)",
-                                            "Sensibilidad para seleccionar regiones a refinar (0.7 por defecto).",
-                                        );
-                                    });
-                                }
-                                RefineMode::Full => {
-                                    ui.label(
-                                        RichText::new("Refina el 100% de la resolución.")
-                                            .size(11.5)
-                                            .color(Palette::TEXT_MUTED),
-                                    );
-                                }
-                            }
 
-                            ui.label(RichText::new("Tamaño de kernel").size(12.5).color(Palette::TEXT_SECONDARY));
-                            let k_seg = segmented_control(
-                                ui,
-                                "kernel_seg",
-                                &mut self.config.refine_kernel_size,
-                                &[(1, "Kernel 1x1"), (3, "Kernel 3x3")],
-                            );
-                            smooth_tooltip(
-                                ui,
-                                &k_seg,
-                                "Kernel (--model-refine-kernel-size)",
-                                "Tamaño de convolución del módulo refinador (3 recomendado en ResNet, 1 opcional en MobileNetV2).",
-                            );
-                        });
-                    },
-                );
+                                ui.label(RichText::new("Tamaño de kernel").size(12.5).color(Palette::TEXT_SECONDARY));
+                                let k_seg = segmented_control(
+                                    ui,
+                                    "kernel_seg",
+                                    &mut self.config.refine_kernel_size,
+                                    &[(1, "Kernel 1x1"), (3, "Kernel 3x3")],
+                                );
+                                smooth_tooltip(
+                                    ui,
+                                    &k_seg,
+                                    "Kernel (--model-refine-kernel-size)",
+                                    "Tamaño de convolución del módulo refinador (3 recomendado en ResNet, 1 opcional en MobileNetV2).",
+                                );
+                            });
+                        },
+                    );
+                }
 
                 // 4. Salida y Formato
                 glass_card(ui, "card_output", "Salidas y Formato", None, |ui| {
@@ -1094,12 +1366,14 @@ impl RemBackApp {
                         smooth_tooltip(ui, &r2, "Máscara Alpha (pha)", "Máscara en escala de grises de transparencia.");
                         let r3 = smooth_toggle(ui, &mut self.config.out_fgr, "fgr");
                         smooth_tooltip(ui, &r3, "Primer Plano (fgr)", "Colores estimados del sujeto sin contaminación del fondo.");
-                        let r4 = smooth_toggle(ui, &mut self.config.out_err, "err");
-                        smooth_tooltip(ui, &r4, "Mapa de Error (err)", "Mapa de incertidumbre de la red base.");
-                        ui.add_enabled_ui(is_refine, |ui| {
-                            let r5 = smooth_toggle(ui, &mut self.config.out_ref, "ref");
-                            smooth_tooltip(ui, &r5, "Mapa de Refinamiento (ref)", "Zonas seleccionadas para refinado HD (solo MattingRefine).");
-                        });
+                        if self.config.engine_mode == EngineMode::BgMattingV2 {
+                            let r4 = smooth_toggle(ui, &mut self.config.out_err, "err");
+                            smooth_tooltip(ui, &r4, "Mapa de Error (err)", "Mapa de incertidumbre de la red base.");
+                            ui.add_enabled_ui(is_refine, |ui| {
+                                let r5 = smooth_toggle(ui, &mut self.config.out_ref, "ref");
+                                smooth_tooltip(ui, &r5, "Mapa de Refinamiento (ref)", "Zonas seleccionadas para refinado HD (solo MattingRefine).");
+                            });
+                        }
                     });
                 });
             });
@@ -1135,18 +1409,37 @@ impl RemBackApp {
 
                     ui.add_space(6.0);
                     ui.allocate_ui(vec2(235.0, 30.0), |ui| {
-                        let ls = segmented_control(
-                            ui,
-                            "layer_seg",
-                            &mut self.config.preview_layer,
-                            &[
-                                (OutputLayer::Com, "com"),
-                                (OutputLayer::Pha, "pha"),
-                                (OutputLayer::Fgr, "fgr"),
-                                (OutputLayer::Err, "err"),
-                                (OutputLayer::Ref, "ref"),
-                            ],
-                        );
+                        let ls = if self.config.engine_mode == EngineMode::AutoNoRef {
+                            if matches!(
+                                self.config.preview_layer,
+                                OutputLayer::Err | OutputLayer::Ref
+                            ) {
+                                self.config.preview_layer = OutputLayer::Com;
+                            }
+                            segmented_control(
+                                ui,
+                                "layer_seg_rvm",
+                                &mut self.config.preview_layer,
+                                &[
+                                    (OutputLayer::Com, "com"),
+                                    (OutputLayer::Pha, "pha"),
+                                    (OutputLayer::Fgr, "fgr"),
+                                ],
+                            )
+                        } else {
+                            segmented_control(
+                                ui,
+                                "layer_seg",
+                                &mut self.config.preview_layer,
+                                &[
+                                    (OutputLayer::Com, "com"),
+                                    (OutputLayer::Pha, "pha"),
+                                    (OutputLayer::Fgr, "fgr"),
+                                    (OutputLayer::Err, "err"),
+                                    (OutputLayer::Ref, "ref"),
+                                ],
+                            )
+                        };
                         smooth_tooltip(
                             ui,
                             &ls,
@@ -1448,12 +1741,18 @@ impl RemBackApp {
                                 BgMode::CustomColor => "Color sólido",
                                 BgMode::TargetMedia => "Fondo personalizado",
                             };
+                            let engine_lbl = match self.config.engine_mode {
+                                EngineMode::AutoNoRef => format!(
+                                    "Auto ({})",
+                                    self.config.simple_quality.rvm_backbone_arg()
+                                ),
+                                EngineMode::BgMattingV2 => {
+                                    format!("BGMv2 {}", self.config.model_type.as_arg())
+                                }
+                            };
                             ui.label(
                                 RichText::new(format!(
-                                    "{} · {} · Capas: [{}]",
-                                    self.config.model_type.as_arg(),
-                                    bg_str,
-                                    layers
+                                    "{engine_lbl} · {bg_str} · Capas: [{layers}]"
                                 ))
                                 .size(12.5)
                                 .color(Palette::TEXT_SECONDARY),
@@ -1557,6 +1856,57 @@ impl RemBackApp {
                         ui.add_space(10.0);
 
                         ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
+                            // Section 0: RemBack Self-Updater
+                            glass_card(ui, "upd_app", "0. Actualizaciones de RemBack (GitHub)", None, |ui| {
+                                ui.horizontal(|ui| {
+                                    badge_pill(ui, &format!("Actual: v{APP_VERSION}"), Palette::CYAN);
+                                    if let Some(rel) = &self.remote_app_release {
+                                        if self.app_update_available {
+                                            badge_pill(
+                                                ui,
+                                                &format!("Disponible: v{}", rel.version),
+                                                Palette::EMERALD_BRIGHT,
+                                            );
+                                        } else {
+                                            badge_pill(ui, "Al día", Palette::EMERALD);
+                                        }
+                                    }
+                                });
+                                if let Some(rel) = self.remote_app_release.clone() {
+                                    if self.app_update_available {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Hay una nueva versión RemBack v{} lista para instalar automáticamente.",
+                                                rel.version
+                                            ))
+                                            .size(12.0)
+                                            .color(Palette::EMERALD_BRIGHT),
+                                        );
+                                        if primary_button(
+                                            ui,
+                                            &format!("Actualizar RemBack a v{}", rel.version),
+                                            !self.updater_busy,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.updater_busy = true;
+                                            self.updater_progress = 0.03;
+                                            self.updater_logs.clear();
+                                            self.updater_rx =
+                                                Some(download_and_launch_app_update(rel));
+                                        }
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new("Comprueba si hay nuevas versiones en ixyren/RemBack.")
+                                            .size(11.5)
+                                            .color(Palette::TEXT_MUTED),
+                                    );
+                                }
+                            });
+
+                            ui.add_space(8.0);
+
                             // Section 1: BackgroundMattingV2 Repo Updater
                             glass_card(ui, "upd_repo", "1. Código Fuente (PeterL1n/BackgroundMattingV2)", None, |ui| {
                                 let installed = self.paths.is_bgmv2_installed();

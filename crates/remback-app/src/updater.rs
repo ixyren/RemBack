@@ -17,6 +17,8 @@ const BGMV2_RELEASE_API: &str =
     "https://api.github.com/repos/PeterL1n/BackgroundMattingV2/releases/latest";
 const BGMV2_ZIP_URL: &str =
     "https://github.com/PeterL1n/BackgroundMattingV2/archive/refs/heads/master.zip";
+const REMBACK_RELEASE_API: &str =
+    "https://api.github.com/repos/ixyren/RemBack/releases/latest";
 
 #[derive(Debug, Clone)]
 pub struct UpdaterPaths {
@@ -132,13 +134,29 @@ pub struct RemoteBgmv2Info {
 }
 
 #[derive(Debug, Clone)]
+pub struct RemoteAppRelease {
+    pub version: String,
+    pub setup_url: String,
+    pub setup_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteCheckResult {
+    pub bgmv2: Option<RemoteBgmv2Info>,
+    pub bgmv2_error: Option<String>,
+    pub app_release: Option<RemoteAppRelease>,
+}
+
+#[derive(Debug, Clone)]
 pub enum UpdaterEvent {
     Log(String),
     Progress(f32, String),
-    CheckFinished(Result<RemoteBgmv2Info, String>),
+    CheckFinished(RemoteCheckResult),
     Bgmv2Updated(Result<Bgmv2InstalledState, String>),
     EnvSetupFinished(Result<(), String>),
     ModelDownloaded(Result<PathBuf, String>),
+    AppUpdateReadyToExit,
+    AppUpdateError(String),
 }
 
 #[derive(Deserialize)]
@@ -194,75 +212,221 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
-/// Query GitHub API for latest BackgroundMattingV2 commit and release assets.
+fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+    let clean = s.trim().trim_start_matches(['v', 'V']);
+    let mut parts = clean.split('.');
+    let maj = parts.next()?.parse().ok()?;
+    let min = parts.next().unwrap_or("0").parse().ok()?;
+    let patch_str = parts
+        .next()
+        .unwrap_or("0")
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("0");
+    let pat = patch_str.parse().ok()?;
+    Some((maj, min, pat))
+}
+
+pub fn is_newer_version(current: &str, remote: &str) -> bool {
+    match (parse_semver(current), parse_semver(remote)) {
+        (Some(cur), Some(rem)) => rem > cur,
+        _ => false,
+    }
+}
+
+/// Query GitHub API for latest BackgroundMattingV2 and RemBack releases.
 pub fn check_bgmv2_updates() -> Receiver<UpdaterEvent> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let agent = http_agent();
+
+        // 1. Check RemBack's own latest release on GitHub
+        let mut app_release = None;
+        if let Ok(resp) = agent
+            .get(REMBACK_RELEASE_API)
+            .set("User-Agent", "RemBack-App")
+            .set("Accept", "application/vnd.github+json")
+            .call()
+        {
+            if let Ok(rel) = resp.into_json::<GhReleaseResp>() {
+                if let Some(asset) = rel
+                    .assets
+                    .into_iter()
+                    .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
+                {
+                    let clean_ver = rel.tag_name.trim_start_matches(['v', 'V']).to_owned();
+                    app_release = Some(RemoteAppRelease {
+                        version: clean_ver,
+                        setup_url: asset.browser_download_url,
+                        setup_name: asset.name,
+                    });
+                }
+            }
+        }
+
+        // 2. Check BackgroundMattingV2 commits & release assets
         let commit_res = agent
             .get(BGMV2_COMMIT_API)
             .set("User-Agent", "RemBack-App")
             .set("Accept", "application/vnd.github+json")
             .call();
 
-        let commit_data: GhCommitResp = match commit_res {
-            Ok(resp) => match resp.into_json() {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(UpdaterEvent::CheckFinished(Err(format!(
-                        "Error al leer respuesta de GitHub: {e}"
-                    ))));
-                    return;
+        let (bgmv2, bgmv2_error) = match commit_res {
+            Ok(resp) => match resp.into_json::<GhCommitResp>() {
+                Ok(commit_data) => {
+                    let mut release_tag = "v1.0.0".to_owned();
+                    let mut models = Vec::new();
+                    if let Ok(resp) = agent
+                        .get(BGMV2_RELEASE_API)
+                        .set("User-Agent", "RemBack-App")
+                        .set("Accept", "application/vnd.github+json")
+                        .call()
+                    {
+                        if let Ok(rel) = resp.into_json::<GhReleaseResp>() {
+                            release_tag = rel.tag_name;
+                            for asset in rel.assets {
+                                if asset.name.starts_with("pytorch_")
+                                    && asset.name.ends_with(".pth")
+                                {
+                                    models.push(ModelAssetInfo {
+                                        name: asset.name,
+                                        url: asset.browser_download_url,
+                                        size_bytes: asset.size,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if models.is_empty() {
+                        models = default_models_fallback();
+                    }
+                    let first_line = commit_data
+                        .commit
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned();
+                    (
+                        Some(RemoteBgmv2Info {
+                            commit_sha: commit_data.sha,
+                            commit_date: commit_data.commit.committer.date,
+                            commit_message: first_line,
+                            release_tag,
+                            models,
+                        }),
+                        None,
+                    )
                 }
+                Err(e) => (None, Some(format!("Error al leer respuesta de GitHub: {e}"))),
             },
-            Err(e) => {
-                let _ = tx.send(UpdaterEvent::CheckFinished(Err(format!(
+            Err(e) => (
+                None,
+                Some(format!(
                     "No se pudo consultar GitHub (PeterL1n/BackgroundMattingV2): {e}"
-                ))));
+                )),
+            ),
+        };
+
+        let _ = tx.send(UpdaterEvent::CheckFinished(RemoteCheckResult {
+            bgmv2,
+            bgmv2_error,
+            app_release,
+        }));
+    });
+    rx
+}
+
+/// Download the latest RemBack installer `.exe`, launch it with `--silent-update`, and signal exit.
+pub fn download_and_launch_app_update(release: RemoteAppRelease) -> Receiver<UpdaterEvent> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(UpdaterEvent::Progress(
+            0.03,
+            format!("Descargando RemBack v{}...", release.version),
+        ));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(300))
+            .build();
+        let resp = match agent
+            .get(&release.setup_url)
+            .set("User-Agent", "RemBack-App")
+            .call()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(UpdaterEvent::AppUpdateError(format!(
+                    "Error al descargar actualización de RemBack: {e}"
+                )));
                 return;
             }
         };
 
-        let mut release_tag = "v1.0.0".to_owned();
-        let mut models = Vec::new();
-        if let Ok(resp) = agent
-            .get(BGMV2_RELEASE_API)
-            .set("User-Agent", "RemBack-App")
-            .set("Accept", "application/vnd.github+json")
-            .call()
-        {
-            if let Ok(rel) = resp.into_json::<GhReleaseResp>() {
-                release_tag = rel.tag_name;
-                for asset in rel.assets {
-                    if asset.name.starts_with("pytorch_") && asset.name.ends_with(".pth") {
-                        models.push(ModelAssetInfo {
-                            name: asset.name,
-                            url: asset.browser_download_url,
-                            size_bytes: asset.size,
-                        });
+        let total_len: u64 = resp
+            .header("Content-Length")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5_500_000);
+
+        let dest = std::env::temp_dir().join(&release.setup_name);
+        let mut out_f = match std::fs::File::create(&dest) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(UpdaterEvent::AppUpdateError(format!(
+                    "No se pudo crear archivo temporal {}: {e}",
+                    dest.display()
+                )));
+                return;
+            }
+        };
+
+        let mut reader = resp.into_reader();
+        let mut buf = [0u8; 65536];
+        let mut downloaded: u64 = 0;
+        let mut last_pct = -1.0_f32;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = out_f.write_all(&buf[..n]) {
+                        let _ = tx.send(UpdaterEvent::AppUpdateError(format!(
+                            "Error al escribir instalador: {e}"
+                        )));
+                        return;
                     }
+                    downloaded += n as u64;
+                    let pct = (downloaded as f32 / total_len.max(1) as f32).clamp(0.0, 1.0);
+                    if pct - last_pct >= 0.02 {
+                        last_pct = pct;
+                        let mb = downloaded as f32 / 1_048_576.0;
+                        let tot = total_len as f32 / 1_048_576.0;
+                        let _ = tx.send(UpdaterEvent::Progress(
+                            pct,
+                            format!("Descargando RemBack v{} ({:.1} / {:.1} MB)", release.version, mb, tot),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(UpdaterEvent::AppUpdateError(format!(
+                        "Error de red: {e}"
+                    )));
+                    return;
                 }
             }
         }
-        if models.is_empty() {
-            models = default_models_fallback();
+        let _ = out_f.flush();
+        drop(out_f);
+
+        let _ = tx.send(UpdaterEvent::Progress(
+            1.0,
+            "Iniciando instalador de actualización...".into(),
+        ));
+        if let Err(e) = Command::new(&dest).arg("--silent-update").spawn() {
+            let _ = tx.send(UpdaterEvent::AppUpdateError(format!(
+                "No se pudo abrir el actualizador: {e}"
+            )));
+            return;
         }
-
-        let first_line = commit_data
-            .commit
-            .message
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_owned();
-
-        let _ = tx.send(UpdaterEvent::CheckFinished(Ok(RemoteBgmv2Info {
-            commit_sha: commit_data.sha,
-            commit_date: commit_data.commit.committer.date,
-            commit_message: first_line,
-            release_tag,
-            models,
-        })));
+        let _ = tx.send(UpdaterEvent::AppUpdateReadyToExit);
     });
     rx
 }
@@ -716,4 +880,18 @@ pub fn setup_python_environment(paths: UpdaterPaths, force_reinstall: bool) -> R
         let _ = tx.send(UpdaterEvent::EnvSetupFinished(Ok(())));
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semver_comparison_works() {
+        assert!(is_newer_version("1.1.0", "v1.2.0"));
+        assert!(is_newer_version("1.1.0", "1.2.0"));
+        assert!(!is_newer_version("1.2.0", "v1.2.0"));
+        assert!(!is_newer_version("1.2.0", "v1.1.9"));
+        assert!(is_newer_version("1.2.0", "2.0.0"));
+    }
 }

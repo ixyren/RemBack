@@ -1,17 +1,24 @@
 """
-RemBack Worker Bridge for PeterL1n/BackgroundMattingV2.
-Handles video metadata inspection, frame extraction, single-frame preview, and full export
-with streaming newline-delimited JSON progress.
+RemBack Worker Bridge.
+Supports:
+  - Engine 'rvm': PeterL1n/RobustVideoMatting TorchScript FP16/FP32 (no reference frame needed)
+  - Engine 'bgmv2': PeterL1n/BackgroundMattingV2 with auto-backbone detection, FP16 CUDA autocast,
+    and optional automatic clean background reconstruction.
 """
 
 import argparse
 import hashlib
 import json
 import os
+import queue
 import shutil
 import sys
 import time
+import urllib.request
 from threading import Thread
+
+
+RVM_BASE_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0"
 
 
 def emit(payload: dict) -> None:
@@ -23,8 +30,12 @@ def emit_stage(progress: float, message: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="RemBack BackgroundMattingV2 Worker")
+    p = argparse.ArgumentParser(description="RemBack Matting Worker")
     p.add_argument("--mode", required=True, choices=["info", "extract", "preview", "export"])
+    p.add_argument("--engine", default="rvm", choices=["rvm", "bgmv2"])
+    p.add_argument("--rvm-backbone", default="resnet50", choices=["resnet50", "mobilenetv3"])
+    p.add_argument("--models-dir", default="")
+    p.add_argument("--fp16", action="store_true")
     p.add_argument("--bgmv2-dir", required=False, default="")
     p.add_argument("--video-src", required=True)
     p.add_argument("--auto-bgr", action="store_true")
@@ -89,28 +100,126 @@ def extract_single_frame(video_path: str, frame_index: int, out_path: str) -> No
     cv2.imwrite(out_path, frame)
 
 
-def load_bgmv2_and_model(args: argparse.Namespace, stage_base: float = 0.10, stage_weights: float = 0.30):
+def resolve_device(torch, requested: str):
+    use_device = requested
+    if use_device == "cuda" and not torch.cuda.is_available():
+        emit({"type": "warn", "message": "CUDA no está disponible en PyTorch; usando CPU."})
+        use_device = "cpu"
+    return torch.device(use_device)
+
+
+def resolve_models_dir(args: argparse.Namespace) -> str:
+    if args.models_dir:
+        os.makedirs(args.models_dir, exist_ok=True)
+        return args.models_dir
+    if args.bgmv2_dir:
+        d = os.path.join(os.path.dirname(args.bgmv2_dir), "models")
+        os.makedirs(d, exist_ok=True)
+        return d
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def ensure_rvm_model(args: argparse.Namespace, device, stage_start: float, stage_end: float) -> tuple[str, bool]:
+    use_fp16 = bool(args.fp16 and device.type == "cuda")
+    prec = "fp16" if use_fp16 else "fp32"
+    filename = f"rvm_{args.rvm_backbone}_{prec}.torchscript"
+    models_dir = resolve_models_dir(args)
+    target_path = os.path.join(models_dir, filename)
+
+    if os.path.isfile(target_path) and os.path.getsize(target_path) > 100_000:
+        return target_path, use_fp16
+
+    url = f"{RVM_BASE_URL}/{filename}"
+    part_path = target_path + ".part"
+    emit_stage(stage_start, f"Descargando modelo automático {filename}...")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "RemBack-App"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        total_len = int(resp.headers.get("Content-Length") or 0)
+        downloaded = 0
+        last_pct = -1.0
+        with open(part_path, "wb") as out_f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+                downloaded += len(chunk)
+                if total_len > 0:
+                    frac = min(1.0, downloaded / float(total_len))
+                    if frac - last_pct >= 0.02:
+                        last_pct = frac
+                        p = stage_start + (stage_end - stage_start) * frac
+                        mb = downloaded / 1_048_576.0
+                        tot_mb = total_len / 1_048_576.0
+                        emit_stage(p, f"Descargando {filename} ({mb:.1f}/{tot_mb:.1f} MB)...")
+
+    os.replace(part_path, target_path)
+    emit_stage(stage_end, f"Modelo {filename} listo.")
+    return target_path, use_fp16
+
+
+def detect_backbone_from_state(state: dict, ckpt_path: str, fallback: str) -> str:
+    keys = list(state.keys())
+    if any(k.startswith("backbone.features.") for k in keys):
+        return "mobilenetv2"
+    if any(k.startswith("backbone.layer3.22.") for k in keys):
+        return "resnet101"
+    if any(k.startswith("backbone.layer3.0.") for k in keys):
+        return "resnet50"
+
+    name = os.path.basename(ckpt_path).lower()
+    if "resnet101" in name:
+        return "resnet101"
+    if "resnet50" in name:
+        return "resnet50"
+    if "mobilenetv2" in name or "mobilenet" in name:
+        return "mobilenetv2"
+    return fallback
+
+
+def load_bgmv2_and_model(args: argparse.Namespace, stage_base: float = 0.10, stage_weights: float = 0.28):
     if not args.bgmv2_dir or not os.path.isdir(args.bgmv2_dir):
-        raise RuntimeError("No se encontró la carpeta de BackgroundMattingV2.")
+        raise RuntimeError("No se encontró BackgroundMattingV2. Instálalo en 'Actualizaciones'.")
     if args.bgmv2_dir not in sys.path:
         sys.path.insert(0, args.bgmv2_dir)
 
-    emit_stage(stage_base, "Cargando PyTorch y red neuronal...")
+    emit_stage(stage_base, "Cargando PyTorch y BackgroundMattingV2...")
     import torch
     from model import MattingBase, MattingRefine
     from inference_utils import HomographicAlignment
 
-    use_device = args.device
-    if use_device == "cuda" and not torch.cuda.is_available():
-        emit({"type": "warn", "message": "CUDA no está disponible en PyTorch; usando CPU."})
-        use_device = "cpu"
-    device = torch.device(use_device)
+    device = resolve_device(torch, args.device)
+    emit_stage(stage_weights, "Cargando pesos (.pth) y verificando arquitectura...")
+
+    ckpt = args.model_checkpoint
+    is_torchscript = os.path.basename(ckpt).lower().startswith("torchscript_")
+    if is_torchscript:
+        model = torch.jit.load(ckpt, map_location=device).eval()
+        ts_fp16 = "fp16" in os.path.basename(ckpt).lower()
+        return torch, device, model, HomographicAlignment, True, ts_fp16
+
+    try:
+        state = torch.load(ckpt, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(ckpt, map_location=device)
+    except Exception:
+        state = torch.load(ckpt, map_location=device)
+
+    backbone = detect_backbone_from_state(state, ckpt, args.model_backbone)
+    if backbone != args.model_backbone:
+        emit({
+            "type": "warn",
+            "message": f"Backbone ajustado automáticamente a '{backbone}' para coincidir con el checkpoint.",
+        })
 
     if args.model_type == "mattingbase":
-        model = MattingBase(args.model_backbone)
+        model = MattingBase(backbone)
     else:
         model = MattingRefine(
-            args.model_backbone,
+            backbone,
             args.model_backbone_scale,
             args.model_refine_mode,
             args.model_refine_sample_pixels,
@@ -118,16 +227,12 @@ def load_bgmv2_and_model(args: argparse.Namespace, stage_base: float = 0.10, sta
             args.model_refine_kernel_size,
         )
 
-    emit_stage(stage_weights, "Cargando pesos del modelo (.pth)...")
     model = model.to(device).eval()
-    try:
-        state = torch.load(args.model_checkpoint, map_location=device, weights_only=True)
-    except TypeError:
-        state = torch.load(args.model_checkpoint, map_location=device)
-    except Exception:
-        state = torch.load(args.model_checkpoint, map_location=device)
     model.load_state_dict(state, strict=False)
-    return torch, device, model, HomographicAlignment
+    use_half = bool(args.fp16 and device.type == "cuda")
+    if use_half:
+        model = model.half()
+    return torch, device, model, HomographicAlignment, False, use_half
 
 
 def generate_auto_background(
@@ -151,7 +256,7 @@ def generate_auto_background(
     cache_path = os.path.join(preview_dir, f"auto_bgr_{cache_key}.png")
 
     if os.path.isfile(cache_path):
-        emit_stage(stage_end, "Usando fondo limpio reconstruido (caché)...")
+        emit_stage(stage_end, "Usando fondo reconstruido en caché...")
         return Image.open(cache_path).convert("RGB").resize((width, height), Image.BILINEAR)
 
     emit_stage(stage_start, "Muestreando fotogramas para reconstruir el fondo...")
@@ -159,7 +264,7 @@ def generate_auto_background(
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir el video para estimar fondo: {video_path}")
     total_frames = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
-    sample_count = min(20, total_frames)
+    sample_count = min(16, total_frames)
     indices = np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
 
     sampled_rgb = []
@@ -180,9 +285,7 @@ def generate_auto_background(
     n_samples = frames_arr.shape[0]
     bg_valid = np.ones((n_samples, height, width), dtype=bool)
 
-    mid_stage = stage_start + (stage_end - stage_start) * 0.35
-    emit_stage(mid_stage, "Segmentando sujeto para aislar el fondo limpio...")
-
+    emit_stage(stage_start + (stage_end - stage_start) * 0.35, "Segmentando sujeto para aislar el fondo...")
     seg_model = None
     try:
         from torchvision.models.segmentation import (
@@ -219,10 +322,7 @@ def generate_auto_background(
                 fg_dilated = cv2.dilate(fg_full, kernel, iterations=1) > 0
                 bg_valid[i] = ~fg_dilated
 
-    emit_stage(
-        stage_start + (stage_end - stage_start) * 0.72,
-        "Calculando mediana temporal y rellenando oclusiones...",
-    )
+    emit_stage(stage_start + (stage_end - stage_start) * 0.72, "Combinando fondo y rellenando oclusiones...")
     bg_out = np.zeros((height, width, 3), dtype=np.uint8)
     hole_mask = np.zeros((height, width), dtype=np.uint8)
     chunk_rows = 128
@@ -239,7 +339,6 @@ def generate_auto_background(
         bg_out[y0:y1, :, :] = np.clip(med, 0, 255).astype(np.uint8)
 
     if np.any(hole_mask):
-        # Fallback for any permanently occluded region: fill using Telea inpainting on working scale
         work_scale = min(1.0, 960.0 / float(max(width, height)))
         if work_scale < 0.99:
             iw = max(64, int(round(width * work_scale)))
@@ -255,7 +354,7 @@ def generate_auto_background(
 
     bg_pil = Image.fromarray(bg_out)
     bg_pil.save(cache_path)
-    emit_stage(stage_end, "Fondo limpio reconstruido automáticamente.")
+    emit_stage(stage_end, "Fondo limpio reconstruido.")
     return bg_pil
 
 
@@ -266,21 +365,24 @@ def safe_align(aligner, src_pil, bgr_pil):
         return src_pil, bgr_pil
 
 
-def parse_rgb_tensor(torch, color_str: str, device):
+def parse_rgb_tensor(torch, color_str: str, device, dtype):
     parts = [int(x.strip()) for x in color_str.split(",")]
     while len(parts) < 3:
         parts.append(0)
     r, g, b = [max(0, min(255, c)) / 255.0 for c in parts[:3]]
-    return torch.tensor([r, g, b], device=device).view(1, 3, 1, 1)
+    return torch.tensor([r, g, b], device=device, dtype=dtype).view(1, 3, 1, 1)
 
 
 class TargetMediaReader:
-    """Reads either a single static image or a looping target video matching (w, h)."""
+    """Reads either a static image or looping target video resized to (w, h)."""
 
     def __init__(self, path: str, width: int, height: int):
         import cv2
+        import numpy as np
         from PIL import Image
 
+        self.cv2 = cv2
+        self.np = np
         self.width = width
         self.height = height
         self.cap = None
@@ -288,64 +390,414 @@ class TargetMediaReader:
         ext = os.path.splitext(path)[1].lower()
         if ext in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"}:
             img = Image.open(path).convert("RGB").resize((width, height), Image.BILINEAR)
-            self.static_rgb = img
+            self.static_rgb = np.asarray(img)
         else:
             self.cap = cv2.VideoCapture(path)
             if not self.cap.isOpened():
                 raise RuntimeError(f"No se pudo abrir el fondo destino: {path}")
 
-    def read_tensor(self, torch, to_tensor, device, frame_idx: int | None = None):
-        import cv2
-        from PIL import Image
-
+    def read_tensor(self, torch, device, dtype, frame_idx: int | None = None):
         if self.static_rgb is not None:
-            return to_tensor(self.static_rgb).unsqueeze(0).to(device, non_blocking=True)
+            t = torch.from_numpy(self.static_rgb).to(device, non_blocking=True)
+            return t.permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
 
         assert self.cap is not None
         if frame_idx is not None:
-            total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx % total)
+            total = int(self.cap.get(self.cv2.CAP_PROP_FRAME_COUNT)) or 1
+            self.cap.set(self.cv2.CAP_PROP_POS_FRAMES, frame_idx % total)
         ok, frame = self.cap.read()
         if not ok:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.cap.set(self.cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = self.cap.read()
         if not ok or frame is None:
-            return torch.zeros((1, 3, self.height, self.width), device=device)
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return torch.zeros((1, 3, self.height, self.width), device=device, dtype=dtype)
+        frame = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
-            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-        return to_tensor(Image.fromarray(frame)).unsqueeze(0).to(device, non_blocking=True)
+            frame = self.cv2.resize(frame, (self.width, self.height), interpolation=self.cv2.INTER_LINEAR)
+        t = torch.from_numpy(frame).to(device, non_blocking=True)
+        return t.permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
 
     def close(self):
         if self.cap is not None:
             self.cap.release()
 
 
-def save_tensor_image(tensor_bchw, path: str) -> None:
-    from torchvision.transforms.functional import to_pil_image
+def save_preview_rgb_or_rgba(tensor_bchw, path: str, max_w: int = 1280) -> None:
+    import cv2
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    img = to_pil_image(tensor_bchw[0].clamp(0.0, 1.0).cpu())
-    img.save(path)
+    arr = tensor_bchw[0].clamp(0.0, 1.0).mul(255).byte().cpu().permute(1, 2, 0).numpy()
+    h, w, c = arr.shape
+    if w > max_w:
+        nh = max(2, int(round(h * (max_w / float(w)))))
+        arr = cv2.resize(arr, (max_w, nh), interpolation=cv2.INTER_AREA)
+    if c == 4:
+        arr_cv = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+    elif c == 1:
+        arr_cv = arr[:, :, 0]
+    else:
+        arr_cv = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(path, arr_cv)
 
 
-def run_model_frame(args, torch, F, model, src_t, bgr_t):
-    if args.model_type == "mattingbase":
-        pha, fgr, err, _ = model(src_t, bgr_t)
+def save_preview_bgr_array(rgb_arr, path: str, max_w: int = 1280) -> None:
+    import cv2
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    h, w, _ = rgb_arr.shape
+    arr = rgb_arr
+    if w > max_w:
+        nh = max(2, int(round(h * (max_w / float(w)))))
+        arr = cv2.resize(arr, (max_w, nh), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(path, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+
+
+class AsyncImageWriter:
+    def __init__(self, path: str, extension: str):
+        import cv2
+
+        self.cv2 = cv2
+        self.path = path
+        self.extension = extension
+        self.index = 0
+        os.makedirs(path, exist_ok=True)
+        self._q: queue.Queue = queue.Queue(maxsize=24)
+        self._worker = Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def _loop(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                break
+            idx, arr = item
+            c = arr.shape[2]
+            if c == 4:
+                out_arr = self.cv2.cvtColor(arr, self.cv2.COLOR_RGBA2BGRA)
+            elif c == 1:
+                out_arr = arr[:, :, 0]
+            else:
+                out_arr = self.cv2.cvtColor(arr, self.cv2.COLOR_RGB2BGR)
+            self.cv2.imwrite(os.path.join(self.path, f"{idx:05d}.{self.extension}"), out_arr)
+
+    def add(self, tensor_bchw):
+        arr = tensor_bchw[0].clamp(0.0, 1.0).mul(255).byte().cpu().permute(1, 2, 0).numpy()
+        self._q.put((self.index, arr))
+        self.index += 1
+
+    def close(self):
+        self._q.put(None)
+        self._worker.join()
+
+
+class AsyncMp4Writer:
+    def __init__(self, path: str, fps: float, w: int, h: int):
+        import cv2
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.cv2 = cv2
+        self.out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        self._q: queue.Queue = queue.Queue(maxsize=24)
+        self._worker = Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def _loop(self):
+        while True:
+            arr = self._q.get()
+            if arr is None:
+                break
+            if arr.shape[2] == 1:
+                bgr = self.cv2.cvtColor(arr, self.cv2.COLOR_GRAY2BGR)
+            else:
+                bgr = self.cv2.cvtColor(arr, self.cv2.COLOR_RGB2BGR)
+            self.out.write(bgr)
+
+    def add(self, tensor_bchw):
+        arr = tensor_bchw[0].clamp(0.0, 1.0).mul(255).byte().cpu().permute(1, 2, 0).numpy()
+        self._q.put(arr)
+
+    def close(self):
+        self._q.put(None)
+        self._worker.join()
+        self.out.release()
+
+
+class ThreadedVideoReader:
+    def __init__(self, video_path: str, width: int, height: int):
+        import cv2
+
+        self.cv2 = cv2
+        self.cap = cv2.VideoCapture(video_path)
+        self.width = width
+        self.height = height
+        self._q: queue.Queue = queue.Queue(maxsize=8)
+        self._stop = False
+        self._thread = Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop:
+            ok, frame_bgr = self.cap.read()
+            if not ok or frame_bgr is None:
+                self._q.put(None)
+                break
+            rgb = self.cv2.cvtColor(frame_bgr, self.cv2.COLOR_BGR2RGB)
+            if rgb.shape[1] != self.width or rgb.shape[0] != self.height:
+                rgb = self.cv2.resize(rgb, (self.width, self.height), interpolation=self.cv2.INTER_LINEAR)
+            self._q.put(rgb)
+        self.cap.release()
+
+    def read_next(self):
+        return self._q.get()
+
+    def close(self):
+        self._stop = True
+
+
+def compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=None):
+    if args.bg_mode == "transparent":
+        # Clean foreground premultiplied alpha + genuine alpha channel
+        return torch.cat([fgr * (pha > 0.01).to(fgr.dtype), pha], dim=1)
+    if args.bg_mode == "target_media" and target_reader is not None:
+        tgt_t = target_reader.read_tensor(torch, fgr.device, fgr.dtype, frame_idx=frame_idx)
+        return fgr * pha + tgt_t * (1.0 - pha)
+    return fgr * pha + solid_bg * (1.0 - pha)
+
+
+def setup_writers(args, fps: float, w: int, h: int, allow_ref: bool):
+    writers = {}
+    out_types = list(args.output_types)
+    if "ref" in out_types and not allow_ref:
+        out_types.remove("ref")
+    if "err" in out_types and args.engine == "rvm":
+        out_types.remove("err")
+    if not out_types:
+        out_types = ["com"]
+
+    for tname in out_types:
+        if args.output_format == "video":
+            if tname == "com" and args.bg_mode == "transparent":
+                seq_dir = os.path.join(args.output_dir, "com_rgba")
+                if os.path.exists(seq_dir):
+                    shutil.rmtree(seq_dir)
+                writers[tname] = AsyncImageWriter(seq_dir, "png")
+            else:
+                writers[tname] = AsyncMp4Writer(os.path.join(args.output_dir, f"{tname}.mp4"), fps, w, h)
+        else:
+            ext = "png" if tname == "com" else "jpg"
+            seq_dir = os.path.join(args.output_dir, tname)
+            if os.path.exists(seq_dir):
+                shutil.rmtree(seq_dir)
+            writers[tname] = AsyncImageWriter(seq_dir, ext)
+    return writers
+
+
+# -------------------- RVM Engine --------------------
+
+
+def handle_preview_rvm(args: argparse.Namespace) -> None:
+    import cv2
+
+    emit_stage(0.08, "Cargando PyTorch y motor rápido (RVM)...")
+    import torch
+
+    device = resolve_device(torch, args.device)
+    model_path, use_fp16 = ensure_rvm_model(args, device, stage_start=0.14, stage_end=0.52)
+    dtype = torch.float16 if use_fp16 else torch.float32
+
+    emit_stage(0.56, "Inicializando red neuronal en GPU/CPU...")
+    model = torch.jit.load(model_path, map_location=device).eval()
+
+    info = probe_video(args.video_src)
+    w = args.video_resize[0] if args.video_resize else info["width"]
+    h = args.video_resize[1] if args.video_resize else info["height"]
+    idx = max(0, min(args.frame_index, info["frame_count"] - 1))
+    downsample_ratio = max(0.125, min(1.0, 512.0 / float(max(w, h))))
+
+    emit_stage(0.66, "Analizando contexto temporal del video...")
+    warmup_start = max(0, idx - 5)
+    cap = cv2.VideoCapture(args.video_src)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, warmup_start)
+
+    target_reader = None
+    if args.bg_mode == "target_media" and args.video_target_bgr:
+        target_reader = TargetMediaReader(args.video_target_bgr, w, h)
+    solid_bg = parse_rgb_tensor(torch, args.bg_color, device, dtype)
+
+    rec = [None, None, None, None]
+    last_rgb = None
+    fgr = pha = None
+
+    with torch.no_grad():
+        for cur_i in range(warmup_start, idx + 1):
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                break
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if rgb.shape[1] != w or rgb.shape[0] != h:
+                rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+            last_rgb = rgb
+            src_t = torch.from_numpy(rgb).to(device).permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
+            fgr, pha, *rec = model(src_t, *rec, downsample_ratio)
+            if cur_i == warmup_start:
+                emit_stage(0.78, "Refinando memoria temporal sobre el sujeto...")
+
+    cap.release()
+    if last_rgb is None or fgr is None or pha is None:
+        raise RuntimeError(f"No se pudo leer el fotograma {idx}")
+
+    emit_stage(0.90, "Componiendo vista previa...")
+    layer = args.preview_layer
+    if layer in ("err", "ref"):
+        layer = "pha"
+
+    if layer == "pha":
+        out_t = pha.repeat(1, 3, 1, 1)
+    elif layer == "fgr":
+        out_t = fgr
+    else:
+        out_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
+
+    if target_reader is not None:
+        target_reader.close()
+
+    preview_dir = args.preview_dir or os.path.join(resolve_models_dir(args), "..", "preview_cache")
+    src_path = os.path.join(preview_dir, "preview_src.png")
+    out_path = os.path.join(preview_dir, "preview_out.png")
+    save_preview_bgr_array(last_rgb, src_path)
+    save_preview_rgb_or_rgba(out_t, out_path)
+
+    emit({
+        "type": "preview_done",
+        "frame": idx,
+        "width": w,
+        "height": h,
+        "src_path": src_path,
+        "out_path": out_path,
+        "layer": layer,
+    })
+
+
+def handle_export_rvm(args: argparse.Namespace) -> None:
+    emit_stage(0.05, "Cargando PyTorch y motor rápido (RVM)...")
+    import torch
+
+    device = resolve_device(torch, args.device)
+    model_path, use_fp16 = ensure_rvm_model(args, device, stage_start=0.10, stage_end=0.32)
+    dtype = torch.float16 if use_fp16 else torch.float32
+
+    emit_stage(0.36, "Inicializando red neuronal en GPU/CPU...")
+    model = torch.jit.load(model_path, map_location=device).eval()
+
+    info = probe_video(args.video_src)
+    w = args.video_resize[0] if args.video_resize else info["width"]
+    h = args.video_resize[1] if args.video_resize else info["height"]
+    fps = info["fps"]
+    total = info["frame_count"]
+    downsample_ratio = max(0.125, min(1.0, 512.0 / float(max(w, h))))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    preview_dir = args.preview_dir or os.path.join(resolve_models_dir(args), "..", "preview_cache")
+    os.makedirs(preview_dir, exist_ok=True)
+    live_out_path = os.path.join(preview_dir, "export_live.png")
+
+    writers = setup_writers(args, fps, w, h, allow_ref=False)
+    target_reader = None
+    if args.bg_mode == "target_media" and args.video_target_bgr:
+        target_reader = TargetMediaReader(args.video_target_bgr, w, h)
+    solid_bg = parse_rgb_tensor(torch, args.bg_color, device, dtype)
+
+    emit_stage(0.45, "Iniciando exportación en tiempo real...")
+    reader = ThreadedVideoReader(args.video_src, w, h)
+    rec = [None, None, None, None]
+    t_start = time.time()
+    frame_idx = 0
+
+    with torch.no_grad():
+        while True:
+            rgb = reader.read_next()
+            if rgb is None:
+                break
+
+            src_t = torch.from_numpy(rgb).to(device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
+            fgr, pha, *rec = model(src_t, *rec, downsample_ratio)
+
+            com_vis = None
+            if "com" in writers:
+                com_vis = compose_output(torch, args, fgr, pha, solid_bg, target_reader)
+                writers["com"].add(com_vis)
+            if "pha" in writers:
+                writers["pha"].add(pha)
+            if "fgr" in writers:
+                writers["fgr"].add(fgr)
+
+            frame_idx += 1
+            elapsed = max(time.time() - t_start, 1e-4)
+            cur_fps = frame_idx / elapsed
+            rem = max(total - frame_idx, 0)
+            eta = rem / max(cur_fps, 1e-4)
+
+            if (frame_idx == 1) or (frame_idx % 5 == 0) or (frame_idx >= total):
+                preview_path = ""
+                if frame_idx % 15 == 1 or frame_idx >= total:
+                    vis = com_vis if com_vis is not None else pha.repeat(1, 3, 1, 1)
+                    save_preview_rgb_or_rgba(vis, live_out_path)
+                    preview_path = live_out_path
+                emit({
+                    "type": "progress",
+                    "frame": frame_idx,
+                    "total": max(total, frame_idx),
+                    "fps": round(cur_fps, 2),
+                    "eta": round(eta, 1),
+                    "preview_path": preview_path,
+                })
+
+    reader.close()
+    if target_reader is not None:
+        target_reader.close()
+    for w_obj in writers.values():
+        w_obj.close()
+
+    emit({
+        "type": "export_done",
+        "output_dir": args.output_dir,
+        "frames": frame_idx,
+        "elapsed": round(time.time() - t_start, 2),
+    })
+
+
+# -------------------- BackgroundMattingV2 Engine --------------------
+
+
+def run_bgmv2_frame(args, torch, F, model, is_torchscript, src_t, bgr_t, use_half: bool):
+    if use_half:
+        src_in = src_t.half()
+        bgr_in = bgr_t.half()
+    else:
+        src_in = src_t
+        bgr_in = bgr_t
+
+    if is_torchscript:
+        pha, fgr = model(src_in, bgr_in)[:2]
+        err = torch.zeros_like(pha)
+        ref = None
+    elif args.model_type == "mattingbase":
+        pha, fgr, err, _ = model(src_in, bgr_in)
         ref = None
     else:
-        pha, fgr, _, _, err, ref = model(src_t, bgr_t)
-    err_up = F.interpolate(err, src_t.shape[2:], mode="bilinear", align_corners=False)
-    ref_up = F.interpolate(ref, src_t.shape[2:], mode="nearest") if ref is not None else None
-    return pha, fgr, err_up, ref_up
+        pha, fgr, _, _, err, ref = model(src_in, bgr_in)
+    err_up = F.interpolate(err.float(), src_t.shape[2:], mode="bilinear", align_corners=False)
+    ref_up = F.interpolate(ref.float(), src_t.shape[2:], mode="nearest") if ref is not None else None
+    return pha.float(), fgr.float(), err_up, ref_up
 
 
-def handle_preview(args: argparse.Namespace) -> None:
+def handle_preview_bgmv2(args: argparse.Namespace) -> None:
     import cv2
+    import numpy as np
     from PIL import Image
     from torchvision.transforms.functional import to_tensor
 
-    torch, device, model, HomographicAlignment = load_bgmv2_and_model(
+    torch, device, model, HomographicAlignment, is_ts, use_half = load_bgmv2_and_model(
         args, stage_base=0.10, stage_weights=0.28
     )
     F = torch.nn.functional
@@ -388,10 +840,11 @@ def handle_preview(args: argparse.Namespace) -> None:
     target_reader = None
     if args.bg_mode == "target_media" and args.video_target_bgr:
         target_reader = TargetMediaReader(args.video_target_bgr, w, h)
+    solid_bg = parse_rgb_tensor(torch, args.bg_color, device, torch.float32)
 
-    emit_stage(0.82, "Ejecutando inferencia BackgroundMattingV2...")
+    emit_stage(0.84, "Ejecutando inferencia BackgroundMattingV2...")
     with torch.no_grad():
-        pha, fgr, err_up, ref_up = run_model_frame(args, torch, F, model, src_t, bgr_t)
+        pha, fgr, err_up, ref_up = run_bgmv2_frame(args, torch, F, model, is_ts, src_t, bgr_t, use_half)
 
         layer = args.preview_layer
         if layer == "ref" and ref_up is None:
@@ -406,14 +859,7 @@ def handle_preview(args: argparse.Namespace) -> None:
         elif layer == "ref":
             out_t = ref_up.repeat(1, 3, 1, 1)
         else:
-            if args.bg_mode == "transparent":
-                out_t = torch.cat([fgr * pha.ne(0), pha], dim=1)
-            elif args.bg_mode == "target_media" and target_reader is not None:
-                tgt_t = target_reader.read_tensor(torch, to_tensor, device, frame_idx=idx)
-                out_t = fgr * pha + tgt_t * (1.0 - pha)
-            else:
-                tgt_t = parse_rgb_tensor(torch, args.bg_color, device)
-                out_t = fgr * pha + tgt_t * (1.0 - pha)
+            out_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
 
     if target_reader is not None:
         target_reader.close()
@@ -421,8 +867,8 @@ def handle_preview(args: argparse.Namespace) -> None:
     emit_stage(0.95, "Guardando vista previa...")
     src_path = os.path.join(preview_dir, "preview_src.png")
     out_path = os.path.join(preview_dir, "preview_out.png")
-    src_pil.save(src_path)
-    save_tensor_image(out_t, out_path)
+    save_preview_bgr_array(np.asarray(src_pil), src_path)
+    save_preview_rgb_or_rgba(out_t, out_path)
 
     emit({
         "type": "preview_done",
@@ -435,65 +881,11 @@ def handle_preview(args: argparse.Namespace) -> None:
     })
 
 
-class AsyncImageWriter:
-    def __init__(self, path: str, extension: str):
-        self.path = path
-        self.extension = extension
-        self.index = 0
-        os.makedirs(path, exist_ok=True)
-        self._threads: list[Thread] = []
-
-    def add(self, tensor_bchw):
-        from torchvision.transforms.functional import to_pil_image
-
-        idx = self.index
-        self.index += 1
-        frame = tensor_bchw[0].clamp(0.0, 1.0).cpu()
-
-        def _save():
-            img = to_pil_image(frame)
-            img.save(os.path.join(self.path, f"{idx:05d}.{self.extension}"))
-
-        t = Thread(target=_save)
-        t.start()
-        self._threads.append(t)
-        if len(self._threads) > 16:
-            for old in self._threads[:-8]:
-                old.join()
-            self._threads = self._threads[-8:]
-
-    def close(self):
-        for t in self._threads:
-            t.join()
-        self._threads.clear()
-
-
-class Mp4Writer:
-    def __init__(self, path: str, fps: float, w: int, h: int):
-        import cv2
-
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self.cv2 = cv2
-        self.out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-
-    def add(self, tensor_bchw):
-        frame = tensor_bchw[0].clamp(0.0, 1.0).mul(255).byte().cpu().permute(1, 2, 0).numpy()
-        if frame.shape[2] == 1:
-            frame = self.cv2.cvtColor(frame, self.cv2.COLOR_GRAY2BGR)
-        else:
-            frame = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
-        self.out.write(frame)
-
-    def close(self):
-        self.out.release()
-
-
-def handle_export(args: argparse.Namespace) -> None:
-    import cv2
+def handle_export_bgmv2(args: argparse.Namespace) -> None:
     from PIL import Image
     from torchvision.transforms.functional import to_tensor
 
-    torch, device, model, HomographicAlignment = load_bgmv2_and_model(
+    torch, device, model, HomographicAlignment, is_ts, use_half = load_bgmv2_and_model(
         args, stage_base=0.05, stage_weights=0.14
     )
     F = torch.nn.functional
@@ -508,27 +900,7 @@ def handle_export(args: argparse.Namespace) -> None:
     preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.bgmv2_dir), "preview_cache")
     os.makedirs(preview_dir, exist_ok=True)
 
-    writers = {}
-    out_types = list(args.output_types)
-    if "ref" in out_types and args.model_type == "mattingbase":
-        out_types.remove("ref")
-
-    for tname in out_types:
-        if args.output_format == "video":
-            if tname == "com" and args.bg_mode == "transparent":
-                # MP4 cannot store alpha channel; export lossless RGBA PNG sequence for transparent mode
-                seq_dir = os.path.join(args.output_dir, "com_rgba")
-                if os.path.exists(seq_dir):
-                    shutil.rmtree(seq_dir)
-                writers[tname] = AsyncImageWriter(seq_dir, "png")
-            else:
-                writers[tname] = Mp4Writer(os.path.join(args.output_dir, f"{tname}.mp4"), fps, w, h)
-        else:
-            ext = "png" if tname == "com" else "jpg"
-            seq_dir = os.path.join(args.output_dir, tname)
-            if os.path.exists(seq_dir):
-                shutil.rmtree(seq_dir)
-            writers[tname] = AsyncImageWriter(seq_dir, ext)
+    writers = setup_writers(args, fps, w, h, allow_ref=(args.model_type == "mattingrefine" and not is_ts))
 
     if args.auto_bgr or not args.video_bgr:
         bgr_base = generate_auto_background(
@@ -545,9 +917,9 @@ def handle_export(args: argparse.Namespace) -> None:
     target_reader = None
     if args.bg_mode == "target_media" and args.video_target_bgr:
         target_reader = TargetMediaReader(args.video_target_bgr, w, h)
-    solid_bg = parse_rgb_tensor(torch, args.bg_color, device)
+    solid_bg = parse_rgb_tensor(torch, args.bg_color, device, torch.float32)
 
-    cap = cv2.VideoCapture(args.video_src)
+    reader = ThreadedVideoReader(args.video_src, w, h)
     live_out_path = os.path.join(preview_dir, "export_live.png")
 
     t_start = time.time()
@@ -555,38 +927,24 @@ def handle_export(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         while True:
-            ok, frame_bgr = cap.read()
-            if not ok or frame_bgr is None:
+            src_rgb = reader.read_next()
+            if src_rgb is None:
                 break
 
-            src_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            src_pil = Image.fromarray(src_rgb).resize((w, h), Image.BILINEAR)
-
             if aligner is not None:
-                src_aligned, bgr_aligned = safe_align(aligner, src_pil, bgr_base)
+                src_aligned, bgr_aligned = safe_align(aligner, Image.fromarray(src_rgb), bgr_base)
                 src_t = to_tensor(src_aligned).unsqueeze(0).to(device, non_blocking=True)
                 bgr_t = to_tensor(bgr_aligned).unsqueeze(0).to(device, non_blocking=True)
             else:
-                src_t = to_tensor(src_pil).unsqueeze(0).to(device, non_blocking=True)
+                src_t = torch.from_numpy(src_rgb).to(device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
                 bgr_t = bgr_tensor_static
 
-            pha, fgr, err_up, ref_up = run_model_frame(args, torch, F, model, src_t, bgr_t)
+            pha, fgr, err_up, ref_up = run_bgmv2_frame(args, torch, F, model, is_ts, src_t, bgr_t, use_half)
 
+            com_vis = None
             if "com" in writers:
-                if args.bg_mode == "transparent":
-                    com_rgba = torch.cat([fgr * pha.ne(0), pha], dim=1)
-                    writers["com"].add(com_rgba)
-                    com_vis = com_rgba
-                elif args.bg_mode == "target_media" and target_reader is not None:
-                    tgt_t = target_reader.read_tensor(torch, to_tensor, device)
-                    com_vis = fgr * pha + tgt_t * (1.0 - pha)
-                    writers["com"].add(com_vis)
-                else:
-                    com_vis = fgr * pha + solid_bg * (1.0 - pha)
-                    writers["com"].add(com_vis)
-            else:
-                com_vis = None
-
+                com_vis = compose_output(torch, args, fgr, pha, solid_bg, target_reader)
+                writers["com"].add(com_vis)
             if "pha" in writers:
                 writers["pha"].add(pha)
             if "fgr" in writers:
@@ -602,12 +960,11 @@ def handle_export(args: argparse.Namespace) -> None:
             rem = max(total - frame_idx, 0)
             eta = rem / max(cur_fps, 1e-4)
 
-            should_emit = (frame_idx == 1) or (frame_idx % 5 == 0) or (frame_idx >= total)
-            if should_emit:
+            if (frame_idx == 1) or (frame_idx % 5 == 0) or (frame_idx >= total):
                 preview_path = ""
                 if frame_idx % 15 == 1 or frame_idx >= total:
                     vis = com_vis if com_vis is not None else pha.repeat(1, 3, 1, 1)
-                    save_tensor_image(vis, live_out_path)
+                    save_preview_rgb_or_rgba(vis, live_out_path)
                     preview_path = live_out_path
                 emit({
                     "type": "progress",
@@ -618,7 +975,7 @@ def handle_export(args: argparse.Namespace) -> None:
                     "preview_path": preview_path,
                 })
 
-    cap.release()
+    reader.close()
     if target_reader is not None:
         target_reader.close()
     for w_obj in writers.values():
@@ -645,9 +1002,15 @@ def main() -> None:
             extract_single_frame(args.video_src, args.frame_index, out)
             emit({"type": "extract_done", "path": out})
         elif args.mode == "preview":
-            handle_preview(args)
+            if args.engine == "rvm":
+                handle_preview_rvm(args)
+            else:
+                handle_preview_bgmv2(args)
         elif args.mode == "export":
-            handle_export(args)
+            if args.engine == "rvm":
+                handle_export_rvm(args)
+            else:
+                handle_export_bgmv2(args)
     except Exception as exc:
         emit({"type": "error", "message": str(exc)})
         sys.exit(1)
