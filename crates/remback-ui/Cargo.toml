@@ -1,0 +1,11 @@
+[package]
+name = "remback-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true

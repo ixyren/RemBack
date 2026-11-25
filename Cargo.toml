@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/remback-ui",
+    "crates/remback-app",
+    "crates/remback-installer",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["ixyren"]
+license = "MIT"
+repository = "https://github.com/ixyren/RemBack"
+
+[workspace.dependencies]
+eframe = { version = "0.31", default-features = true }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+directories = "5"
+winres = "0.1"
+remback-ui = { path = "crates/remback-ui" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

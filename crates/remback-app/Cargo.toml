@@ -1,0 +1,26 @@
+[package]
+name = "remback-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remback"
+path = "src/main.rs"
+
+[dependencies]
+remback-ui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+image.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+zip.workspace = true
+directories.workspace = true
+
+[build-dependencies]
+winres.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "remback-installer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remback-installer"
+path = "src/main.rs"
+
+[dependencies]
+remback-ui.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+flate2.workspace = true
+directories.workspace = true
+
+[build-dependencies]
+flate2.workspace = true
+winres.workspace = true
