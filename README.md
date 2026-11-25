@@ -24,10 +24,13 @@ Permite eliminar el fondo de videos o reemplazarlo por pantalla verde, color só
   - `--video-resize`: redimensionado rápido (`1080p`, `720p` o personalizado).
   - `--output-format`: `video` (`.mp4`) o `image_sequences` (`PNG`/`JPG`).
   - `--output-types`: `com`, `pha`, `fgr`, `err`, `ref`.
-- **Vista previa interactiva**:
+- **Modo sin frame de referencia (Reconstrucción automática de fondo)**:
+  - `BackgroundMattingV2` requiere originalmente una fotografía limpia del fondo sin el sujeto; RemBack v1.1.0 incorpora el modo **Sin imagen de referencia (Auto)** que muestrea el video, segmenta el sujeto, calcula la mediana temporal de los píxeles de fondo y rellena zonas ocluidas mediante *inpainting* automáticamente (con caché local por video).
+- **Vista previa interactiva y barras de progreso en vivo**:
+  - Barra de progreso detallada en tiempo real tanto al generar la **Vista Previa** (carga de modelo, estimación automática de fondo e inferencia) como durante la **Exportación** completa.
   - Modos **Resultado**, **Dividido** (barra deslizable *Antes / Después*) y **Original**.
   - Selector de fotograma y capa de inspección (`com`, `pha`, `fgr`, `err`, `ref`).
-  - Extractor automático del fotograma 0 como fondo limpio de referencia.
+  - Extractor automático del fotograma 0 cuando prefieras usar un frame de referencia manual.
 - **Actualizador integrado de BackgroundMattingV2**:
   - Verifica nuevas actualizaciones directamente en el repositorio oficial `PeterL1n/BackgroundMattingV2` en GitHub.
   - Descarga/actualiza el motor, configura un entorno Python + PyTorch (con CUDA si detecta GPU NVIDIA) aislado en `%LOCALAPPDATA%\RemBack\venv` y descarga los checkpoints `.pth` oficiales con un clic.
@@ -38,7 +41,7 @@ Permite eliminar el fondo de videos o reemplazarlo por pantalla verde, color só
 
 ## Instalación (Windows)
 
-1. Descarga **`RemBack-v1.0.0-Setup.exe`** desde la sección [Releases](https://github.com/ixyren/RemBack/releases/latest).
+1. Descarga **`RemBack-v1.1.0-Setup.exe`** desde la sección [Releases](https://github.com/ixyren/RemBack/releases/latest).
 2. Ejecuta el instalador y elige la carpeta de destino.
 3. Al abrir **RemBack**, haz clic en **Actualizaciones** para descargar `BackgroundMattingV2`, configurar el entorno Python/PyTorch y bajar un modelo `.pth` (por ejemplo `pytorch_resnet50.pth` o `pytorch_mobilenetv2.pth`).
 
@@ -56,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File .\build_release.ps1
 
 Genera:
 - `target\release\remback.exe`
-- `dist\RemBack-v1.0.0-Setup.exe`
+- `dist\RemBack-v1.1.0-Setup.exe`
 
 ---
 

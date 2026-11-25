@@ -126,6 +126,7 @@ impl OutputLayer {
 #[serde(default)]
 pub struct MattingConfig {
     pub video_src: String,
+    pub auto_bgr: bool,
     pub video_bgr: String,
     pub bg_mode: BgMode,
     pub chroma_color: [u8; 3],
@@ -174,6 +175,7 @@ impl Default for MattingConfig {
 
         Self {
             video_src: String::new(),
+            auto_bgr: true,
             video_bgr: String::new(),
             bg_mode: BgMode::GreenScreen,
             chroma_color: [120, 255, 155],
@@ -280,9 +282,11 @@ impl MattingConfig {
         if self.video_src.trim().is_empty() || !Path::new(&self.video_src).is_file() {
             return Err("Selecciona un archivo de video de origen válido (--video-src).".into());
         }
-        if self.video_bgr.trim().is_empty() || !Path::new(&self.video_bgr).is_file() {
+        if !self.auto_bgr
+            && (self.video_bgr.trim().is_empty() || !Path::new(&self.video_bgr).is_file())
+        {
             return Err(
-                "Selecciona una imagen de fondo limpia (--video-bgr), o usa 'Extraer Frame 0'.".into(),
+                "Selecciona una imagen de fondo limpia (--video-bgr), usa 'Extraer Frame 0' o activa 'Sin imagen de referencia (Auto)'.".into(),
             );
         }
         if self.model_checkpoint.trim().is_empty() || !Path::new(&self.model_checkpoint).is_file() {
@@ -323,6 +327,29 @@ mod tests {
         assert!((cfg.refine_threshold - 0.7).abs() < 1e-6);
         assert_eq!(cfg.refine_kernel_size, 3);
         assert_eq!(cfg.chroma_color, [120, 255, 155]);
+        assert!(cfg.auto_bgr);
+    }
+
+    #[test]
+    fn auto_bgr_skips_missing_video_bgr_validation() {
+        let tmp_dir = std::env::temp_dir().join("remback_cfg_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let vid = tmp_dir.join("dummy.mp4");
+        let ckpt = tmp_dir.join("dummy.pth");
+        std::fs::write(&vid, b"0").unwrap();
+        std::fs::write(&ckpt, b"0").unwrap();
+
+        let mut cfg = MattingConfig::default();
+        cfg.video_src = vid.to_string_lossy().into_owned();
+        cfg.model_checkpoint = ckpt.to_string_lossy().into_owned();
+        cfg.auto_bgr = true;
+        cfg.video_bgr.clear();
+        assert!(cfg.validate(false).is_ok());
+
+        cfg.auto_bgr = false;
+        assert!(cfg.validate(false).is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

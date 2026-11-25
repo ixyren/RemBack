@@ -44,6 +44,10 @@ pub enum WorkerEvent {
         eta: f32,
         preview_path: String,
     },
+    Stage {
+        progress: f32,
+        message: String,
+    },
     ExportDone {
         output_dir: String,
         frames: u32,
@@ -81,6 +85,11 @@ enum RawWorkerMsg {
         eta: f32,
         #[serde(default)]
         preview_path: String,
+    },
+    #[serde(rename = "stage")]
+    Stage {
+        progress: f32,
+        message: String,
     },
     #[serde(rename = "export_done")]
     ExportDone {
@@ -245,6 +254,9 @@ fn spawn_python_worker(
                             eta,
                             preview_path,
                         },
+                        RawWorkerMsg::Stage { progress, message } => {
+                            WorkerEvent::Stage { progress, message }
+                        }
                         RawWorkerMsg::ExportDone {
                             output_dir,
                             frames,
@@ -306,8 +318,6 @@ fn build_common_args(cfg: &MattingConfig, paths: &UpdaterPaths) -> Vec<String> {
         paths.bgmv2_dir.to_string_lossy().into_owned(),
         "--video-src".into(),
         cfg.video_src.clone(),
-        "--video-bgr".into(),
-        cfg.video_bgr.clone(),
         "--bg-mode".into(),
         cfg.bg_mode.as_arg().into(),
         "--bg-color".into(),
@@ -334,6 +344,12 @@ fn build_common_args(cfg: &MattingConfig, paths: &UpdaterPaths) -> Vec<String> {
         paths.preview_dir.to_string_lossy().into_owned(),
     ];
 
+    if cfg.auto_bgr {
+        args.push("--auto-bgr".into());
+    } else if !cfg.video_bgr.trim().is_empty() {
+        args.push("--video-bgr".into());
+        args.push(cfg.video_bgr.clone());
+    }
     if !cfg.video_target_bgr.trim().is_empty() {
         args.push("--video-target-bgr".into());
         args.push(cfg.video_target_bgr.clone());

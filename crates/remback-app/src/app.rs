@@ -56,9 +56,13 @@ pub struct RemBackApp {
     preview_out_tex: Option<TextureHandle>,
     preview_fade_start: Option<f64>,
     preview_busy: bool,
+    preview_progress: f32,
+    preview_stage: String,
 
     // Export state
     export_busy: bool,
+    export_stage_progress: f32,
+    export_stage: String,
     export_frame: u32,
     export_total: u32,
     export_fps: f32,
@@ -117,7 +121,11 @@ impl RemBackApp {
             preview_out_tex: None,
             preview_fade_start: None,
             preview_busy: false,
+            preview_progress: 0.0,
+            preview_stage: String::new(),
             export_busy: false,
+            export_stage_progress: 0.0,
+            export_stage: String::new(),
             export_frame: 0,
             export_total: 0,
             export_fps: 0.0,
@@ -225,6 +233,15 @@ impl RemBackApp {
                                 self.preview_fade_start = Some(ctx.input(|i| i.time));
                             }
                         }
+                    }
+                }
+                WorkerEvent::Stage { progress, message } => {
+                    if self.preview_busy {
+                        self.preview_progress = progress.clamp(0.0, 1.0);
+                        self.preview_stage = message;
+                    } else if self.export_busy {
+                        self.export_stage_progress = progress.clamp(0.0, 1.0);
+                        self.export_stage = message;
                     }
                 }
                 WorkerEvent::ExportDone {
@@ -421,6 +438,8 @@ impl RemBackApp {
         match run_preview(&self.paths, &self.config) {
             Ok(h) => {
                 self.preview_busy = true;
+                self.preview_progress = 0.04;
+                self.preview_stage = "Iniciando motor...".into();
                 self.worker = Some(h);
             }
             Err(e) => self.push_toast(ctx, e, true),
@@ -439,6 +458,8 @@ impl RemBackApp {
         match run_export(&self.paths, &self.config) {
             Ok(h) => {
                 self.export_busy = true;
+                self.export_stage_progress = 0.03;
+                self.export_stage = "Iniciando exportación...".into();
                 self.export_frame = 0;
                 self.export_total = self
                     .video_info
@@ -627,40 +648,63 @@ impl RemBackApp {
                     }
 
                     ui.add_space(4.0);
-                    ui.label(RichText::new("Fondo limpio (referencia)").size(12.5).color(Palette::TEXT_SECONDARY));
-                    ui.horizontal(|ui| {
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.config.video_bgr)
-                                .desired_width(ui.available_width() - 88.0)
-                                .hint_text("Imagen de fondo sin el sujeto"),
-                        );
-                        smooth_tooltip(
-                            ui,
-                            &edit,
-                            "Fondo estático (--video-bgr)",
-                            "BackgroundMattingV2 requiere una foto del mismo escenario sin la persona/sujeto para lograr precisión milimétrica.",
-                        );
-                        let btn = secondary_button(ui, "Elegir...", true);
-                        if btn.clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Imagen", &["png", "jpg", "jpeg", "bmp", "webp"])
-                                .pick_file()
-                            {
-                                self.config.video_bgr = p.to_string_lossy().into_owned();
-                                self.config.save();
-                            }
-                        }
-                    });
-
-                    let extract_btn = secondary_button(ui, "Extraer Frame 0 del video", !self.config.video_src.is_empty());
+                    let auto_tog = smooth_toggle(
+                        ui,
+                        &mut self.config.auto_bgr,
+                        "Sin imagen de referencia (Auto)",
+                    );
+                    if auto_tog.changed() {
+                        self.config.save();
+                    }
                     smooth_tooltip(
                         ui,
-                        &extract_btn,
-                        "Extraer primer fotograma",
-                        "Extrae automáticamente el fotograma 0 del video por si el inicio está limpio sin el sujeto.",
+                        &auto_tog,
+                        "Fondo automático sin frame de referencia",
+                        "BackgroundMattingV2 requiere originalmente una foto vacía del escenario (--video-bgr). Al activar esta opción, RemBack muestrea el video, segmenta al sujeto y reconstruye el fondo limpio automáticamente.",
                     );
-                    if extract_btn.clicked() {
-                        self.start_extract_frame0(ctx);
+
+                    if self.config.auto_bgr {
+                        ui.label(
+                            RichText::new("Se reconstruirá el fondo limpio automáticamente desde el video.")
+                                .size(11.0)
+                                .color(Palette::EMERALD_BRIGHT),
+                        );
+                    } else {
+                        ui.label(RichText::new("Fondo limpio (referencia)").size(12.5).color(Palette::TEXT_SECONDARY));
+                        ui.horizontal(|ui| {
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut self.config.video_bgr)
+                                    .desired_width(ui.available_width() - 88.0)
+                                    .hint_text("Imagen de fondo sin el sujeto"),
+                            );
+                            smooth_tooltip(
+                                ui,
+                                &edit,
+                                "Fondo estático (--video-bgr)",
+                                "Foto del mismo escenario sin la persona/sujeto para lograr precisión milimétrica.",
+                            );
+                            let btn = secondary_button(ui, "Elegir...", true);
+                            if btn.clicked() {
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("Imagen", &["png", "jpg", "jpeg", "bmp", "webp"])
+                                    .pick_file()
+                                {
+                                    self.config.video_bgr = p.to_string_lossy().into_owned();
+                                    self.config.save();
+                                }
+                            }
+                        });
+
+                        let extract_btn = secondary_button(ui, "Extraer Frame 0 del video", !self.config.video_src.is_empty());
+                        smooth_tooltip(
+                            ui,
+                            &extract_btn,
+                            "Extraer primer fotograma",
+                            "Extrae automáticamente el fotograma 0 del video por si el inicio está limpio sin el sujeto.",
+                        );
+                        if extract_btn.clicked() {
+                            self.start_extract_frame0(ctx);
+                        }
                     }
 
                     ui.add_space(4.0);
@@ -1158,7 +1202,7 @@ impl RemBackApp {
         ui.add_space(10.0);
 
         // Main preview canvas
-        let dock_height = 88.0;
+        let dock_height = 96.0;
         let canvas_h = (ui.available_height() - dock_height).max(240.0);
         let canvas_w = ui.available_width();
         let (canvas_rect, _) = ui.allocate_exact_size(vec2(canvas_w, canvas_h), Sense::hover());
@@ -1280,7 +1324,7 @@ impl RemBackApp {
             let hint = if !self.engine_ready() {
                 "Paso 1: Abre 'Actualizaciones' para instalar BackgroundMattingV2 y PyTorch."
             } else {
-                "Selecciona tu video, el fondo limpio y pulsa 'Vista Previa' para comprobar el recorte."
+                "Selecciona tu video y pulsa 'Vista Previa' para comprobar el recorte."
             };
             painter.text(
                 pos2(c.x, c.y + 34.0),
@@ -1293,25 +1337,45 @@ impl RemBackApp {
 
         if self.preview_busy {
             let c = inner_rect.center();
-            let pill = Rect::from_center_size(c, vec2(220.0, 44.0));
-            painter.rect_filled(
-                pill,
-                CornerRadius::same(12),
-                Color32::from_rgba_unmultiplied(11, 14, 20, 220),
-            );
-            painter.rect_stroke(
-                pill,
-                CornerRadius::same(12),
-                Stroke::new(1.0_f32, Palette::EMERALD),
-                StrokeKind::Inside,
-            );
-            painter.text(
-                c,
-                egui::Align2::CENTER_CENTER,
-                "Calculando vista previa...",
-                egui::FontId::proportional(13.0),
-                Palette::EMERALD_BRIGHT,
-            );
+            let card_rect = Rect::from_center_size(c, vec2(340.0_f32.min(inner_rect.width() - 24.0), 108.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(card_rect), |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(15, 20, 30, 238))
+                    .stroke(Stroke::new(1.0_f32, Palette::EMERALD))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let stage_lbl = if self.preview_stage.is_empty() {
+                            "Generando vista previa..."
+                        } else {
+                            &self.preview_stage
+                        };
+                        ui.label(
+                            RichText::new(stage_lbl)
+                                .size(12.5)
+                                .strong()
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.add_space(6.0);
+                        let pct_lbl = format!("{:.0}%", self.preview_progress * 100.0);
+                        smooth_progress_bar(
+                            ui,
+                            "preview_prog",
+                            self.preview_progress,
+                            true,
+                            Some(&pct_lbl),
+                        );
+                        ui.add_space(6.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if secondary_button(ui, "Cancelar", true).clicked() {
+                                if let Some(w) = &self.worker {
+                                    w.cancel();
+                                }
+                            }
+                        });
+                    });
+            });
         }
 
         ui.add_space(10.0);
@@ -1324,23 +1388,40 @@ impl RemBackApp {
             .inner_margin(Margin::symmetric(14, 12))
             .show(ui, |ui| {
                 if self.export_busy {
-                    let frac = if self.export_total > 0 {
-                        self.export_frame as f32 / self.export_total as f32
+                    let (prog_val, stage_txt, bar_lbl) = if self.export_frame == 0 {
+                        let st = if self.export_stage.is_empty() {
+                            "Preparando exportación...".to_owned()
+                        } else {
+                            self.export_stage.clone()
+                        };
+                        let pct = format!("{:.0}%", self.export_stage_progress * 100.0);
+                        (self.export_stage_progress, st, pct)
                     } else {
-                        0.0
+                        let frac = if self.export_total > 0 {
+                            self.export_frame as f32 / self.export_total as f32
+                        } else {
+                            0.0
+                        };
+                        let lbl = format!(
+                            "{} / {} frames ({:.0}%) · {:.1} fps · ETA {:.0}s",
+                            self.export_frame,
+                            self.export_total,
+                            frac * 100.0,
+                            self.export_fps,
+                            self.export_eta
+                        );
+                        (frac, "Exportando video con BackgroundMattingV2...".to_owned(), lbl)
                     };
-                    let lbl = format!(
-                        "{} / {} frames ({:.0}%) · {:.1} fps · ETA {:.0}s",
-                        self.export_frame,
-                        self.export_total,
-                        frac * 100.0,
-                        self.export_fps,
-                        self.export_eta
-                    );
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.set_width((ui.available_width() - 120.0).max(160.0));
-                            smooth_progress_bar(ui, "export_prog", frac, true, Some(&lbl));
+                            ui.label(
+                                RichText::new(&stage_txt)
+                                    .size(12.0)
+                                    .color(Palette::TEXT_SECONDARY),
+                            );
+                            ui.add_space(4.0);
+                            smooth_progress_bar(ui, "export_prog", prog_val, true, Some(&bar_lbl));
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let cancel_btn = secondary_button(ui, "Cancelar", true);

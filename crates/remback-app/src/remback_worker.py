@@ -5,6 +5,7 @@ with streaming newline-delimited JSON progress.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -17,11 +18,16 @@ def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def emit_stage(progress: float, message: str) -> None:
+    emit({"type": "stage", "progress": round(float(progress), 4), "message": message})
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RemBack BackgroundMattingV2 Worker")
     p.add_argument("--mode", required=True, choices=["info", "extract", "preview", "export"])
     p.add_argument("--bgmv2-dir", required=False, default="")
     p.add_argument("--video-src", required=True)
+    p.add_argument("--auto-bgr", action="store_true")
     p.add_argument("--video-bgr", default="")
     p.add_argument("--video-target-bgr", default="")
     p.add_argument("--bg-mode", default="green", choices=["green", "transparent", "custom_color", "target_media"])
@@ -83,12 +89,13 @@ def extract_single_frame(video_path: str, frame_index: int, out_path: str) -> No
     cv2.imwrite(out_path, frame)
 
 
-def load_bgmv2_and_model(args: argparse.Namespace):
+def load_bgmv2_and_model(args: argparse.Namespace, stage_base: float = 0.10, stage_weights: float = 0.30):
     if not args.bgmv2_dir or not os.path.isdir(args.bgmv2_dir):
         raise RuntimeError("No se encontró la carpeta de BackgroundMattingV2.")
     if args.bgmv2_dir not in sys.path:
         sys.path.insert(0, args.bgmv2_dir)
 
+    emit_stage(stage_base, "Cargando PyTorch y red neuronal...")
     import torch
     from model import MattingBase, MattingRefine
     from inference_utils import HomographicAlignment
@@ -111,6 +118,7 @@ def load_bgmv2_and_model(args: argparse.Namespace):
             args.model_refine_kernel_size,
         )
 
+    emit_stage(stage_weights, "Cargando pesos del modelo (.pth)...")
     model = model.to(device).eval()
     try:
         state = torch.load(args.model_checkpoint, map_location=device, weights_only=True)
@@ -120,6 +128,135 @@ def load_bgmv2_and_model(args: argparse.Namespace):
         state = torch.load(args.model_checkpoint, map_location=device)
     model.load_state_dict(state, strict=False)
     return torch, device, model, HomographicAlignment
+
+
+def generate_auto_background(
+    video_path: str,
+    width: int,
+    height: int,
+    torch,
+    device,
+    preview_dir: str,
+    stage_start: float,
+    stage_end: float,
+):
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    os.makedirs(preview_dir, exist_ok=True)
+    st = os.stat(video_path)
+    key_raw = f"{os.path.abspath(video_path)}|{st.st_mtime_ns}|{st.st_size}|{width}x{height}"
+    cache_key = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:16]
+    cache_path = os.path.join(preview_dir, f"auto_bgr_{cache_key}.png")
+
+    if os.path.isfile(cache_path):
+        emit_stage(stage_end, "Usando fondo limpio reconstruido (caché)...")
+        return Image.open(cache_path).convert("RGB").resize((width, height), Image.BILINEAR)
+
+    emit_stage(stage_start, "Muestreando fotogramas para reconstruir el fondo...")
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"No se pudo abrir el video para estimar fondo: {video_path}")
+    total_frames = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+    sample_count = min(20, total_frames)
+    indices = np.linspace(0, total_frames - 1, num=sample_count, dtype=int).tolist()
+
+    sampled_rgb = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ok, frame_bgr = cap.read()
+        if ok and frame_bgr is not None:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if rgb.shape[1] != width or rgb.shape[0] != height:
+                rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+            sampled_rgb.append(rgb)
+    cap.release()
+
+    if not sampled_rgb:
+        raise RuntimeError("No se pudieron leer fotogramas del video para reconstruir el fondo.")
+
+    frames_arr = np.stack(sampled_rgb, axis=0)
+    n_samples = frames_arr.shape[0]
+    bg_valid = np.ones((n_samples, height, width), dtype=bool)
+
+    mid_stage = stage_start + (stage_end - stage_start) * 0.35
+    emit_stage(mid_stage, "Segmentando sujeto para aislar el fondo limpio...")
+
+    seg_model = None
+    try:
+        from torchvision.models.segmentation import (
+            LRASPP_MobileNet_V3_Large_Weights,
+            lraspp_mobilenet_v3_large,
+        )
+
+        weights = LRASPP_MobileNet_V3_Large_Weights.DEFAULT
+        seg_model = lraspp_mobilenet_v3_large(weights=weights).to(device).eval()
+    except Exception as exc:
+        emit({
+            "type": "warn",
+            "message": f"Segmentador automático no disponible ({exc}); usando mediana temporal simple.",
+        })
+
+    if seg_model is not None:
+        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+        max_side = 512
+        scale = min(1.0, max_side / float(max(width, height)))
+        sw = max(64, int(round(width * scale)))
+        sh = max(64, int(round(height * scale)))
+        k_sz = max(9, int(round(min(width, height) * 0.025)) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+
+        with torch.no_grad():
+            for i in range(n_samples):
+                small = cv2.resize(frames_arr[i], (sw, sh), interpolation=cv2.INTER_LINEAR)
+                t_in = torch.from_numpy(small).to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                t_in = (t_in - mean) / std
+                out = seg_model(t_in)["out"]
+                fg_small = (out.argmax(1)[0] != 0).cpu().numpy().astype(np.uint8)
+                fg_full = cv2.resize(fg_small, (width, height), interpolation=cv2.INTER_NEAREST)
+                fg_dilated = cv2.dilate(fg_full, kernel, iterations=1) > 0
+                bg_valid[i] = ~fg_dilated
+
+    emit_stage(
+        stage_start + (stage_end - stage_start) * 0.72,
+        "Calculando mediana temporal y rellenando oclusiones...",
+    )
+    bg_out = np.zeros((height, width, 3), dtype=np.uint8)
+    hole_mask = np.zeros((height, width), dtype=np.uint8)
+    chunk_rows = 128
+    for y0 in range(0, height, chunk_rows):
+        y1 = min(height, y0 + chunk_rows)
+        sub_frames = frames_arr[:, y0:y1, :, :].astype(np.float32)
+        sub_valid = bg_valid[:, y0:y1, :]
+        sub_frames[~sub_valid] = np.nan
+        with np.errstate(all="ignore"):
+            med = np.nanmedian(sub_frames, axis=0)
+        nan_pix = np.isnan(med).any(axis=2)
+        hole_mask[y0:y1, :] = nan_pix.astype(np.uint8) * 255
+        med = np.nan_to_num(med, nan=0.0)
+        bg_out[y0:y1, :, :] = np.clip(med, 0, 255).astype(np.uint8)
+
+    if np.any(hole_mask):
+        # Fallback for any permanently occluded region: fill using Telea inpainting on working scale
+        work_scale = min(1.0, 960.0 / float(max(width, height)))
+        if work_scale < 0.99:
+            iw = max(64, int(round(width * work_scale)))
+            ih = max(64, int(round(height * work_scale)))
+            small_bg = cv2.resize(bg_out, (iw, ih), interpolation=cv2.INTER_AREA)
+            small_mask = cv2.resize(hole_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
+            inpainted_small = cv2.inpaint(small_bg, small_mask, 7, cv2.INPAINT_TELEA)
+            inpainted = cv2.resize(inpainted_small, (width, height), interpolation=cv2.INTER_LINEAR)
+        else:
+            inpainted = cv2.inpaint(bg_out, hole_mask, 7, cv2.INPAINT_TELEA)
+        hole_bool = hole_mask > 0
+        bg_out[hole_bool] = inpainted[hole_bool]
+
+    bg_pil = Image.fromarray(bg_out)
+    bg_pil.save(cache_path)
+    emit_stage(stage_end, "Fondo limpio reconstruido automáticamente.")
+    return bg_pil
 
 
 def safe_align(aligner, src_pil, bgr_pil):
@@ -208,9 +345,12 @@ def handle_preview(args: argparse.Namespace) -> None:
     from PIL import Image
     from torchvision.transforms.functional import to_tensor
 
-    torch, device, model, HomographicAlignment = load_bgmv2_and_model(args)
+    torch, device, model, HomographicAlignment = load_bgmv2_and_model(
+        args, stage_base=0.10, stage_weights=0.28
+    )
     F = torch.nn.functional
 
+    emit_stage(0.42, "Leyendo fotograma de video...")
     info = probe_video(args.video_src)
     cap = cv2.VideoCapture(args.video_src)
     idx = max(0, min(args.frame_index, info["frame_count"] - 1))
@@ -223,11 +363,22 @@ def handle_preview(args: argparse.Namespace) -> None:
     w = args.video_resize[0] if args.video_resize else info["width"]
     h = args.video_resize[1] if args.video_resize else info["height"]
 
+    preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.bgmv2_dir), "preview_cache")
+    os.makedirs(preview_dir, exist_ok=True)
+
     src_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     src_pil = Image.fromarray(src_rgb).resize((w, h), Image.BILINEAR)
-    bgr_pil = Image.open(args.video_bgr).convert("RGB").resize((w, h), Image.BILINEAR)
+
+    if args.auto_bgr or not args.video_bgr:
+        bgr_pil = generate_auto_background(
+            args.video_src, w, h, torch, device, preview_dir, stage_start=0.50, stage_end=0.74
+        )
+    else:
+        emit_stage(0.65, "Cargando imagen de fondo...")
+        bgr_pil = Image.open(args.video_bgr).convert("RGB").resize((w, h), Image.BILINEAR)
 
     if args.preprocess_alignment:
+        emit_stage(0.77, "Aplicando alineación homográfica...")
         aligner = HomographicAlignment()
         src_pil, bgr_pil = safe_align(aligner, src_pil, bgr_pil)
 
@@ -238,6 +389,7 @@ def handle_preview(args: argparse.Namespace) -> None:
     if args.bg_mode == "target_media" and args.video_target_bgr:
         target_reader = TargetMediaReader(args.video_target_bgr, w, h)
 
+    emit_stage(0.82, "Ejecutando inferencia BackgroundMattingV2...")
     with torch.no_grad():
         pha, fgr, err_up, ref_up = run_model_frame(args, torch, F, model, src_t, bgr_t)
 
@@ -266,8 +418,7 @@ def handle_preview(args: argparse.Namespace) -> None:
     if target_reader is not None:
         target_reader.close()
 
-    preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.bgmv2_dir), "preview_cache")
-    os.makedirs(preview_dir, exist_ok=True)
+    emit_stage(0.95, "Guardando vista previa...")
     src_path = os.path.join(preview_dir, "preview_src.png")
     out_path = os.path.join(preview_dir, "preview_out.png")
     src_pil.save(src_path)
@@ -342,7 +493,9 @@ def handle_export(args: argparse.Namespace) -> None:
     from PIL import Image
     from torchvision.transforms.functional import to_tensor
 
-    torch, device, model, HomographicAlignment = load_bgmv2_and_model(args)
+    torch, device, model, HomographicAlignment = load_bgmv2_and_model(
+        args, stage_base=0.05, stage_weights=0.14
+    )
     F = torch.nn.functional
 
     info = probe_video(args.video_src)
@@ -352,6 +505,8 @@ def handle_export(args: argparse.Namespace) -> None:
     total = info["frame_count"]
 
     os.makedirs(args.output_dir, exist_ok=True)
+    preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.bgmv2_dir), "preview_cache")
+    os.makedirs(preview_dir, exist_ok=True)
 
     writers = {}
     out_types = list(args.output_types)
@@ -375,7 +530,15 @@ def handle_export(args: argparse.Namespace) -> None:
                 shutil.rmtree(seq_dir)
             writers[tname] = AsyncImageWriter(seq_dir, ext)
 
-    bgr_base = Image.open(args.video_bgr).convert("RGB").resize((w, h), Image.BILINEAR)
+    if args.auto_bgr or not args.video_bgr:
+        bgr_base = generate_auto_background(
+            args.video_src, w, h, torch, device, preview_dir, stage_start=0.18, stage_end=0.35
+        )
+    else:
+        emit_stage(0.25, "Cargando imagen de fondo...")
+        bgr_base = Image.open(args.video_bgr).convert("RGB").resize((w, h), Image.BILINEAR)
+
+    emit_stage(0.40, "Iniciando exportación de fotogramas...")
     bgr_tensor_static = to_tensor(bgr_base).unsqueeze(0).to(device, non_blocking=True)
     aligner = HomographicAlignment() if args.preprocess_alignment else None
 
@@ -385,8 +548,6 @@ def handle_export(args: argparse.Namespace) -> None:
     solid_bg = parse_rgb_tensor(torch, args.bg_color, device)
 
     cap = cv2.VideoCapture(args.video_src)
-    preview_dir = args.preview_dir or os.path.join(os.path.dirname(args.bgmv2_dir), "preview_cache")
-    os.makedirs(preview_dir, exist_ok=True)
     live_out_path = os.path.join(preview_dir, "export_live.png")
 
     t_start = time.time()
