@@ -213,6 +213,11 @@ pub struct MattingConfig {
     pub out_err: bool,
     pub out_ref: bool,
 
+    pub mask_tolerance: f32,
+    pub mask_softness: f32,
+    pub mask_expand: i32,
+    pub mask_clean_artifacts: bool,
+
     pub preview_layer: OutputLayer,
     pub preview_frame: u32,
 }
@@ -267,6 +272,11 @@ impl Default for MattingConfig {
             out_err: false,
             out_ref: false,
 
+            mask_tolerance: 0.25,
+            mask_softness: 0.25,
+            mask_expand: 0,
+            mask_clean_artifacts: true,
+
             preview_layer: OutputLayer::Com,
             preview_frame: 0,
         }
@@ -306,8 +316,11 @@ impl MattingConfig {
         }
     }
 
-    /// Return the list of selected `--output-types` respecting model capabilities.
+    /// Return the list of selected `--output-types` respecting UI mode and model capabilities.
     pub fn selected_output_types(&self) -> Vec<&'static str> {
+        if self.ui_mode == UiMode::Simple {
+            return vec!["com"];
+        }
         let mut types = Vec::new();
         if self.out_com {
             types.push("com");
@@ -318,16 +331,45 @@ impl MattingConfig {
         if self.out_fgr {
             types.push("fgr");
         }
-        if self.out_err {
+        if self.out_err && self.engine_mode == EngineMode::BgMattingV2 {
             types.push("err");
         }
-        if self.out_ref && self.model_type == ModelType::MattingRefine {
+        if self.out_ref
+            && self.engine_mode == EngineMode::BgMattingV2
+            && self.model_type == ModelType::MattingRefine
+        {
             types.push("ref");
         }
         if types.is_empty() {
             types.push("com");
         }
         types
+    }
+
+    /// Clear human-readable label of the exact model/file that will execute.
+    pub fn active_model_display(&self) -> String {
+        match self.engine_mode {
+            EngineMode::AutoNoRef => {
+                let prec = if self.use_fp16 && self.device == ComputeDevice::Cuda {
+                    "fp16"
+                } else {
+                    "fp32"
+                };
+                format!(
+                    "rvm_{}_{}.torchscript (Sin Referencia)",
+                    self.simple_quality.rvm_backbone_arg(),
+                    prec
+                )
+            }
+            EngineMode::BgMattingV2 => {
+                let ckpt_name = Path::new(&self.model_checkpoint)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("sin checkpoint .pth");
+                format!("{ckpt_name} (BackgroundMattingV2)")
+            }
+        }
     }
 
     /// Effective RGB background color to composite over when using solid/chroma mode.
@@ -398,6 +440,34 @@ mod tests {
         assert_eq!(cfg.engine_mode, EngineMode::AutoNoRef);
         assert_eq!(cfg.simple_quality, SimpleQuality::Balanced);
         assert!(cfg.use_fp16);
+        assert!((cfg.mask_tolerance - 0.25).abs() < 1e-6);
+        assert!((cfg.mask_softness - 0.25).abs() < 1e-6);
+        assert_eq!(cfg.mask_expand, 0);
+        assert!(cfg.mask_clean_artifacts);
+    }
+
+    #[test]
+    fn simple_mode_always_exports_color_composite() {
+        let mut cfg = MattingConfig::default();
+        cfg.ui_mode = UiMode::Simple;
+        cfg.out_com = false;
+        cfg.out_pha = true;
+        assert_eq!(cfg.selected_output_types(), vec!["com"]);
+
+        cfg.ui_mode = UiMode::Advanced;
+        assert_eq!(cfg.selected_output_types(), vec!["pha"]);
+    }
+
+    #[test]
+    fn active_model_display_is_explicit() {
+        let mut cfg = MattingConfig::default();
+        cfg.engine_mode = EngineMode::AutoNoRef;
+        cfg.simple_quality = SimpleQuality::Balanced;
+        assert!(cfg.active_model_display().contains("rvm_resnet50_fp16.torchscript"));
+
+        cfg.engine_mode = EngineMode::BgMattingV2;
+        cfg.model_checkpoint = r"C:\models\pytorch_resnet101.pth".into();
+        assert!(cfg.active_model_display().contains("pytorch_resnet101.pth"));
     }
 
     #[test]
@@ -449,6 +519,8 @@ mod tests {
     #[test]
     fn ref_output_disabled_for_mattingbase() {
         let mut cfg = MattingConfig::default();
+        cfg.ui_mode = UiMode::Advanced;
+        cfg.engine_mode = EngineMode::BgMattingV2;
         cfg.model_type = ModelType::MattingBase;
         cfg.out_com = true;
         cfg.out_ref = true;

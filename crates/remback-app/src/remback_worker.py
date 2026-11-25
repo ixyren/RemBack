@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-format", default="video", choices=["video", "image_sequences"])
     p.add_argument("--frame-index", type=int, default=0)
     p.add_argument("--preview-layer", default="com", choices=["com", "pha", "fgr", "err", "ref"])
+    p.add_argument("--mask-tolerance", type=float, default=0.25)
+    p.add_argument("--mask-softness", type=float, default=0.25)
+    p.add_argument("--mask-expand", type=int, default=0)
+    p.add_argument("--mask-clean-artifacts", action="store_true")
     p.add_argument("--extract-out", default="")
     p.add_argument("--preview-dir", default="")
     return p.parse_args()
@@ -566,6 +570,64 @@ class ThreadedVideoReader:
         self._stop = True
 
 
+def postprocess_alpha(torch, args: argparse.Namespace, pha):
+    import cv2
+    import numpy as np
+
+    tol = float(max(0.0, min(0.95, args.mask_tolerance)))
+    soft = float(max(0.0, min(1.0, args.mask_softness)))
+    expand_px = int(max(-12, min(12, args.mask_expand)))
+    clean_art = bool(args.mask_clean_artifacts)
+
+    if tol <= 0.001 and soft >= 0.999 and expand_px == 0 and not clean_art:
+        return pha
+
+    alpha_np = pha[0, 0].float().clamp(0.0, 1.0).cpu().numpy()
+    h, w = alpha_np.shape
+
+    if clean_art and min(h, w) >= 32:
+        scale = min(1.0, 480.0 / float(max(h, w)))
+        sw = max(16, int(round(w * scale)))
+        sh = max(16, int(round(h * scale)))
+        small = cv2.resize(alpha_np, (sw, sh), interpolation=cv2.INTER_AREA)
+        thresh = max(0.18, tol * 0.85)
+        binary = (small > thresh).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if num_labels > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            min_area = max(25.0, 0.012 * float(sw * sh))
+            keep = np.zeros((sh, sw), dtype=np.uint8)
+            any_kept = False
+            for idx_lbl, area in enumerate(areas, start=1):
+                if float(area) >= min_area:
+                    keep[labels == idx_lbl] = 255
+                    any_kept = True
+            if not any_kept and len(areas) > 0:
+                best_lbl = 1 + int(np.argmax(areas))
+                keep[labels == best_lbl] = 255
+
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, k_close)
+            k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            keep = cv2.dilate(keep, k_dil, iterations=1)
+            keep_f = cv2.GaussianBlur(keep.astype(np.float32) / 255.0, (9, 9), 0)
+            keep_full = cv2.resize(keep_f, (w, h), interpolation=cv2.INTER_LINEAR)
+            alpha_np = alpha_np * keep_full
+
+    if expand_px != 0:
+        k_sz = 2 * abs(expand_px) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+        if expand_px > 0:
+            alpha_np = cv2.dilate(alpha_np, kernel, iterations=1)
+        else:
+            alpha_np = cv2.erode(alpha_np, kernel, iterations=1)
+
+    low = tol * 0.78
+    span = max(0.02, soft * (1.0 - low))
+    alpha_np = np.clip((alpha_np - low) / span, 0.0, 1.0)
+    return torch.from_numpy(alpha_np).to(device=pha.device, dtype=pha.dtype).unsqueeze(0).unsqueeze(0)
+
+
 def compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=None):
     if args.bg_mode == "transparent":
         # Clean foreground premultiplied alpha + genuine alpha channel
@@ -658,26 +720,23 @@ def handle_preview_rvm(args: argparse.Namespace) -> None:
     if last_rgb is None or fgr is None or pha is None:
         raise RuntimeError(f"No se pudo leer el fotograma {idx}")
 
-    emit_stage(0.90, "Componiendo vista previa...")
-    layer = args.preview_layer
-    if layer in ("err", "ref"):
-        layer = "pha"
-
-    if layer == "pha":
-        out_t = pha.repeat(1, 3, 1, 1)
-    elif layer == "fgr":
-        out_t = fgr
-    else:
-        out_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
+    emit_stage(0.88, "Refinando máscara y componiendo capas...")
+    pha = postprocess_alpha(torch, args, pha)
+    com_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
+    pha_t = pha.repeat(1, 3, 1, 1)
 
     if target_reader is not None:
         target_reader.close()
 
     preview_dir = args.preview_dir or os.path.join(resolve_models_dir(args), "..", "preview_cache")
     src_path = os.path.join(preview_dir, "preview_src.png")
-    out_path = os.path.join(preview_dir, "preview_out.png")
+    com_path = os.path.join(preview_dir, "preview_com.png")
+    pha_path = os.path.join(preview_dir, "preview_pha.png")
+    fgr_path = os.path.join(preview_dir, "preview_fgr.png")
     save_preview_bgr_array(last_rgb, src_path)
-    save_preview_rgb_or_rgba(out_t, out_path)
+    save_preview_rgb_or_rgba(com_t, com_path)
+    save_preview_rgb_or_rgba(pha_t, pha_path)
+    save_preview_rgb_or_rgba(fgr, fgr_path)
 
     emit({
         "type": "preview_done",
@@ -685,8 +744,12 @@ def handle_preview_rvm(args: argparse.Namespace) -> None:
         "width": w,
         "height": h,
         "src_path": src_path,
-        "out_path": out_path,
-        "layer": layer,
+        "out_path": com_path,
+        "com_path": com_path,
+        "pha_path": pha_path,
+        "fgr_path": fgr_path,
+        "err_path": "",
+        "ref_path": "",
     })
 
 
@@ -733,6 +796,7 @@ def handle_export_rvm(args: argparse.Namespace) -> None:
 
             src_t = torch.from_numpy(rgb).to(device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
             fgr, pha, *rec = model(src_t, *rec, downsample_ratio)
+            pha = postprocess_alpha(torch, args, pha)
 
             com_vis = None
             if "com" in writers:
@@ -857,30 +921,30 @@ def handle_preview_bgmv2(args: argparse.Namespace) -> None:
     emit_stage(0.84, "Ejecutando inferencia BackgroundMattingV2...")
     with torch.no_grad():
         pha, fgr, err_up, ref_up = run_bgmv2_frame(args, torch, F, model, is_ts, src_t, bgr_t, use_half)
-
-        layer = args.preview_layer
-        if layer == "ref" and ref_up is None:
-            layer = "err"
-
-        if layer == "pha":
-            out_t = pha.repeat(1, 3, 1, 1)
-        elif layer == "fgr":
-            out_t = fgr
-        elif layer == "err":
-            out_t = err_up.repeat(1, 3, 1, 1)
-        elif layer == "ref":
-            out_t = ref_up.repeat(1, 3, 1, 1)
-        else:
-            out_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
+        pha = postprocess_alpha(torch, args, pha)
+        com_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
+        pha_t = pha.repeat(1, 3, 1, 1)
+        err_t = err_up.repeat(1, 3, 1, 1)
+        ref_t = ref_up.repeat(1, 3, 1, 1) if ref_up is not None else None
 
     if target_reader is not None:
         target_reader.close()
 
     emit_stage(0.95, "Guardando vista previa...")
     src_path = os.path.join(preview_dir, "preview_src.png")
-    out_path = os.path.join(preview_dir, "preview_out.png")
+    com_path = os.path.join(preview_dir, "preview_com.png")
+    pha_path = os.path.join(preview_dir, "preview_pha.png")
+    fgr_path = os.path.join(preview_dir, "preview_fgr.png")
+    err_path = os.path.join(preview_dir, "preview_err.png")
+    ref_path = os.path.join(preview_dir, "preview_ref.png") if ref_t is not None else ""
+
     save_preview_bgr_array(np.asarray(src_pil), src_path)
-    save_preview_rgb_or_rgba(out_t, out_path)
+    save_preview_rgb_or_rgba(com_t, com_path)
+    save_preview_rgb_or_rgba(pha_t, pha_path)
+    save_preview_rgb_or_rgba(fgr, fgr_path)
+    save_preview_rgb_or_rgba(err_t, err_path)
+    if ref_t is not None:
+        save_preview_rgb_or_rgba(ref_t, ref_path)
 
     emit({
         "type": "preview_done",
@@ -888,8 +952,12 @@ def handle_preview_bgmv2(args: argparse.Namespace) -> None:
         "width": w,
         "height": h,
         "src_path": src_path,
-        "out_path": out_path,
-        "layer": layer,
+        "out_path": com_path,
+        "com_path": com_path,
+        "pha_path": pha_path,
+        "fgr_path": fgr_path,
+        "err_path": err_path,
+        "ref_path": ref_path,
     })
 
 
@@ -952,6 +1020,7 @@ def handle_export_bgmv2(args: argparse.Namespace) -> None:
                 bgr_t = bgr_tensor_static
 
             pha, fgr, err_up, ref_up = run_bgmv2_frame(args, torch, F, model, is_ts, src_t, bgr_t, use_half)
+            pha = postprocess_alpha(torch, args, pha)
 
             com_vis = None
             if "com" in writers:

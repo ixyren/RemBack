@@ -186,7 +186,7 @@ struct GhAsset {
     size: u64,
 }
 
-fn default_models_fallback() -> Vec<ModelAssetInfo> {
+pub fn default_models_fallback() -> Vec<ModelAssetInfo> {
     vec![
         ModelAssetInfo {
             name: "pytorch_mobilenetv2.pth".into(),
@@ -202,6 +202,21 @@ fn default_models_fallback() -> Vec<ModelAssetInfo> {
             name: "pytorch_resnet101.pth".into(),
             url: "https://github.com/PeterL1n/BackgroundMattingV2/releases/download/v1.0.0/pytorch_resnet101.pth".into(),
             size_bytes: 233_000_000,
+        },
+    ]
+}
+
+pub fn rvm_model_assets() -> Vec<ModelAssetInfo> {
+    vec![
+        ModelAssetInfo {
+            name: "rvm_mobilenetv3_fp16.torchscript".into(),
+            url: "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp16.torchscript".into(),
+            size_bytes: 7_952_067,
+        },
+        ModelAssetInfo {
+            name: "rvm_resnet50_fp16.torchscript".into(),
+            url: "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp16.torchscript".into(),
+            size_bytes: 54_173_764,
         },
     ]
 }

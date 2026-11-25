@@ -17,9 +17,10 @@ use crate::config::{
     OutputLayer, RefineMode, SimpleQuality, UiMode,
 };
 use crate::updater::{
-    check_bgmv2_updates, download_and_launch_app_update, download_model_asset, is_newer_version,
-    setup_python_environment, update_bgmv2_repo, Bgmv2InstalledState, ModelAssetInfo,
-    RemoteAppRelease, RemoteBgmv2Info, UpdaterEvent, UpdaterPaths,
+    check_bgmv2_updates, default_models_fallback, download_and_launch_app_update,
+    download_model_asset, is_newer_version, rvm_model_assets, setup_python_environment,
+    update_bgmv2_repo, Bgmv2InstalledState, ModelAssetInfo, RemoteAppRelease, RemoteBgmv2Info,
+    UpdaterEvent, UpdaterPaths,
 };
 use crate::worker::{
     run_export, run_extract_frame, run_preview, run_probe_video, VideoInfo, WorkerEvent,
@@ -55,6 +56,11 @@ pub struct RemBackApp {
     split_pos: f32,
     preview_src_tex: Option<TextureHandle>,
     preview_out_tex: Option<TextureHandle>,
+    preview_com_tex: Option<TextureHandle>,
+    preview_pha_tex: Option<TextureHandle>,
+    preview_fgr_tex: Option<TextureHandle>,
+    preview_err_tex: Option<TextureHandle>,
+    preview_ref_tex: Option<TextureHandle>,
     preview_fade_start: Option<f64>,
     preview_busy: bool,
     preview_progress: f32,
@@ -100,10 +106,22 @@ impl RemBackApp {
         let mut config = MattingConfig::load_or_default();
         let local_models = paths.list_local_models();
 
+        if config.ui_mode == UiMode::Simple {
+            config.preview_layer = OutputLayer::Com;
+        }
         if config.model_checkpoint.trim().is_empty() || !Path::new(&config.model_checkpoint).is_file()
         {
-            if let Some(first) = local_models.first() {
-                config.model_checkpoint = first.to_string_lossy().into_owned();
+            if let Some(best) = local_models
+                .iter()
+                .find(|p| p.to_string_lossy().contains("resnet101"))
+                .or_else(|| {
+                    local_models
+                        .iter()
+                        .find(|p| p.to_string_lossy().contains("resnet50"))
+                })
+                .or_else(|| local_models.first())
+            {
+                config.model_checkpoint = best.to_string_lossy().into_owned();
             }
         }
 
@@ -122,6 +140,11 @@ impl RemBackApp {
             split_pos: 0.5,
             preview_src_tex: None,
             preview_out_tex: None,
+            preview_com_tex: None,
+            preview_pha_tex: None,
+            preview_fgr_tex: None,
+            preview_err_tex: None,
+            preview_ref_tex: None,
             preview_fade_start: None,
             preview_busy: false,
             preview_progress: 0.0,
@@ -206,9 +229,40 @@ impl RemBackApp {
                     height,
                     src_path,
                     out_path,
+                    com_path,
+                    pha_path,
+                    fgr_path,
+                    err_path,
+                    ref_path,
                 } => {
                     self.preview_src_tex = Self::load_png_texture(ctx, "remback_src", &src_path);
-                    self.preview_out_tex = Self::load_png_texture(ctx, "remback_out", &out_path);
+                    let com_file = if com_path.is_empty() {
+                        &out_path
+                    } else {
+                        &com_path
+                    };
+                    self.preview_com_tex = Self::load_png_texture(ctx, "remback_com", com_file);
+                    self.preview_pha_tex = if pha_path.is_empty() {
+                        None
+                    } else {
+                        Self::load_png_texture(ctx, "remback_pha", &pha_path)
+                    };
+                    self.preview_fgr_tex = if fgr_path.is_empty() {
+                        None
+                    } else {
+                        Self::load_png_texture(ctx, "remback_fgr", &fgr_path)
+                    };
+                    self.preview_err_tex = if err_path.is_empty() {
+                        None
+                    } else {
+                        Self::load_png_texture(ctx, "remback_err", &err_path)
+                    };
+                    self.preview_ref_tex = if ref_path.is_empty() {
+                        None
+                    } else {
+                        Self::load_png_texture(ctx, "remback_ref", &ref_path)
+                    };
+                    self.preview_out_tex = self.preview_com_tex.clone();
                     self.preview_fade_start = Some(ctx.input(|i| i.time));
                     self.preview_busy = false;
                     self.push_toast(
@@ -233,6 +287,7 @@ impl RemBackApp {
                         if let Some(tex) =
                             Self::load_png_texture(ctx, "remback_live", &preview_path)
                         {
+                            self.preview_com_tex = Some(tex.clone());
                             self.preview_out_tex = Some(tex);
                             if self.preview_fade_start.is_none() {
                                 self.preview_fade_start = Some(ctx.input(|i| i.time));
@@ -380,14 +435,26 @@ impl RemBackApp {
                     match res {
                         Ok(path) => {
                             self.local_models = self.paths.list_local_models();
-                            self.config.model_checkpoint = path.to_string_lossy().into_owned();
+                            let fname = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            if fname.ends_with(".torchscript") {
+                                self.config.engine_mode = EngineMode::AutoNoRef;
+                                self.config.simple_quality = if fname.contains("mobilenet") {
+                                    SimpleQuality::Fast
+                                } else {
+                                    SimpleQuality::Balanced
+                                };
+                            } else {
+                                self.config.model_checkpoint = path.to_string_lossy().into_owned();
+                                self.sync_backbone_from_checkpoint();
+                            }
                             self.config.save();
                             self.push_toast(
                                 ctx,
-                                format!(
-                                    "Modelo descargado: {}",
-                                    path.file_name().unwrap_or_default().to_string_lossy()
-                                ),
+                                format!("Modelo descargado y activado: {fname}"),
                                 false,
                             );
                         }
@@ -420,6 +487,117 @@ impl RemBackApp {
         if let Some(detected) = Backbone::detect_from_path(&self.config.model_checkpoint) {
             self.config.model_backbone = detected;
         }
+    }
+
+    fn active_preview_out_tex(&self) -> Option<&TextureHandle> {
+        let preferred = match self.config.preview_layer {
+            OutputLayer::Com => self.preview_com_tex.as_ref(),
+            OutputLayer::Pha => self.preview_pha_tex.as_ref(),
+            OutputLayer::Fgr => self.preview_fgr_tex.as_ref(),
+            OutputLayer::Err => self.preview_err_tex.as_ref(),
+            OutputLayer::Ref => self.preview_ref_tex.as_ref(),
+        };
+        preferred
+            .or(self.preview_com_tex.as_ref())
+            .or(self.preview_out_tex.as_ref())
+    }
+
+    fn render_mask_tuning_card(&mut self, ui: &mut Ui) {
+        glass_card(ui, "card_mask_tuning", "Ajuste de Máscara y Tolerancia", None, |ui| {
+            let mut changed = false;
+
+            let mut tol_pct = (self.config.mask_tolerance * 100.0).round() as u32;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Tolerancia fondo:")
+                        .size(12.5)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                let sl = smooth_slider(ui, &mut tol_pct, 0..=95, "%");
+                if sl.changed() {
+                    self.config.mask_tolerance = (tol_pct as f32) / 100.0;
+                    changed = true;
+                }
+                smooth_tooltip(
+                    ui,
+                    &sl,
+                    "Tolerancia al fondo (Limpieza)",
+                    "Sube este porcentaje para eliminar halos o restos semitransparentes del fondo alrededor del sujeto (25% recomendado).",
+                );
+            });
+
+            let mut soft_pct = (self.config.mask_softness * 100.0).round() as u32;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Suavizado borde:")
+                        .size(12.5)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                let sl = smooth_slider(ui, &mut soft_pct, 5..=100, "%");
+                if sl.changed() {
+                    self.config.mask_softness = (soft_pct as f32) / 100.0;
+                    changed = true;
+                }
+                smooth_tooltip(
+                    ui,
+                    &sl,
+                    "Suavizado del contorno",
+                    "Valores bajos (10–25%) dan un recorte más nítido y firme; valores altos (50–100%) suavizan el borde.",
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Expansión borde:")
+                        .size(12.5)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                let sl = smooth_slider(ui, &mut self.config.mask_expand, -10..=10, " px");
+                if sl.changed() {
+                    changed = true;
+                }
+                smooth_tooltip(
+                    ui,
+                    &sl,
+                    "Expandir o contraer máscara",
+                    "Negativo (-1 a -4 px) contrae el borde para quitar halos de color; positivo expande la silueta.",
+                );
+            });
+
+            let clean_tog = smooth_toggle(
+                ui,
+                &mut self.config.mask_clean_artifacts,
+                "Eliminar artefactos sueltos (manchas/islas)",
+            );
+            if clean_tog.changed() {
+                changed = true;
+            }
+            smooth_tooltip(
+                ui,
+                &clean_tog,
+                "Limpieza automática de artefactos",
+                "Elimina puntos, manchas o partes falsas del fondo desconectadas de la persona principal.",
+            );
+
+            ui.horizontal(|ui| {
+                if secondary_button(ui, "Restaurar valores", true).clicked() {
+                    self.config.mask_tolerance = 0.25;
+                    self.config.mask_softness = 0.25;
+                    self.config.mask_expand = 0;
+                    self.config.mask_clean_artifacts = true;
+                    changed = true;
+                }
+                ui.label(
+                    RichText::new("Pulsa 'Vista Previa' para ver el ajuste")
+                        .size(11.0)
+                        .color(Palette::TEXT_MUTED),
+                );
+            });
+
+            if changed {
+                self.config.save();
+            }
+        });
     }
 
     fn start_probe_video(&mut self, ctx: &egui::Context) {
@@ -919,6 +1097,9 @@ impl RemBackApp {
                     ],
                 );
                 if mode_seg.changed() {
+                    if self.config.ui_mode == UiMode::Simple {
+                        self.config.preview_layer = OutputLayer::Com;
+                    }
                     self.config.save();
                 }
                 smooth_tooltip(
@@ -934,60 +1115,91 @@ impl RemBackApp {
                         self.render_replacement_and_output_dir(ui);
                     });
 
-                    glass_card(ui, "card_simple_quality", "2. Calidad y Velocidad", Some("Auto"), |ui| {
-                        let mut use_ref = self.config.engine_mode == EngineMode::BgMattingV2;
-                        let ref_tog = smooth_toggle(
-                            ui,
-                            &mut use_ref,
-                            "Tengo foto del fondo vacío (BackgroundMattingV2)",
+                    glass_card(ui, "card_simple_quality", "2. Modelo y Calidad", None, |ui| {
+                        #[derive(Clone, Copy, PartialEq, Eq)]
+                        enum SimpleProfile {
+                            FastRvm,
+                            BalancedRvm,
+                            Bgmv2ResNet101,
+                        }
+
+                        let mut profile = match self.config.engine_mode {
+                            EngineMode::AutoNoRef => match self.config.simple_quality {
+                                SimpleQuality::Fast => SimpleProfile::FastRvm,
+                                SimpleQuality::Balanced => SimpleProfile::BalancedRvm,
+                            },
+                            EngineMode::BgMattingV2 => SimpleProfile::Bgmv2ResNet101,
+                        };
+
+                        ui.label(
+                            RichText::new("Elige el modelo a utilizar")
+                                .size(12.5)
+                                .color(Palette::TEXT_SECONDARY),
                         );
-                        if ref_tog.changed() {
-                            self.config.engine_mode = if use_ref {
-                                self.config.auto_bgr = false;
-                                EngineMode::BgMattingV2
-                            } else {
-                                EngineMode::AutoNoRef
-                            };
+                        let prof_seg = segmented_control(
+                            ui,
+                            "simple_profile_seg",
+                            &mut profile,
+                            &[
+                                (SimpleProfile::FastRvm, "MobileNetV3"),
+                                (SimpleProfile::BalancedRvm, "ResNet50"),
+                                (SimpleProfile::Bgmv2ResNet101, "ResNet101 (BGMv2)"),
+                            ],
+                        );
+                        if prof_seg.changed() {
+                            match profile {
+                                SimpleProfile::FastRvm => {
+                                    self.config.engine_mode = EngineMode::AutoNoRef;
+                                    self.config.simple_quality = SimpleQuality::Fast;
+                                }
+                                SimpleProfile::BalancedRvm => {
+                                    self.config.engine_mode = EngineMode::AutoNoRef;
+                                    self.config.simple_quality = SimpleQuality::Balanced;
+                                }
+                                SimpleProfile::Bgmv2ResNet101 => {
+                                    self.config.engine_mode = EngineMode::BgMattingV2;
+                                    self.config.model_type = ModelType::MattingRefine;
+                                    self.config.model_backbone = Backbone::ResNet101;
+                                    if let Some(p) = self
+                                        .local_models
+                                        .iter()
+                                        .find(|m| m.to_string_lossy().contains("resnet101"))
+                                    {
+                                        self.config.model_checkpoint =
+                                            p.to_string_lossy().into_owned();
+                                    }
+                                }
+                            }
                             self.config.save();
                         }
                         smooth_tooltip(
                             ui,
-                            &ref_tog,
-                            "Elegir motor según material",
-                            "Desactivado (recomendado): recorta automáticamente sin foto previa del fondo.\nActivado: usa BackgroundMattingV2 con tu fotografía limpia del escenario.",
+                            &prof_seg,
+                            "Modelo neuronal",
+                            "MobileNetV3 y ResNet50 (RVM): automáticos sin foto de fondo.\nResNet101 (BackgroundMattingV2): usa tu checkpoint .pth descargado (con foto limpia o reconstrucción auto).",
                         );
 
-                        if self.config.engine_mode == EngineMode::AutoNoRef {
-                            ui.label(
-                                RichText::new("Modo automático sin foto previa · rápido y preciso.")
-                                    .size(11.5)
-                                    .color(Palette::EMERALD_BRIGHT),
-                            );
-                            ui.label(
-                                RichText::new("Perfil de calidad")
-                                    .size(12.5)
-                                    .color(Palette::TEXT_SECONDARY),
-                            );
-                            let q_seg = segmented_control(
+                        ui.label(
+                            RichText::new(format!(
+                                "Modelo activo: {}",
+                                self.config.active_model_display()
+                            ))
+                            .size(11.5)
+                            .color(Palette::EMERALD_BRIGHT),
+                        );
+
+                        if self.config.engine_mode == EngineMode::BgMattingV2 {
+                            let auto_tog = smooth_toggle(
                                 ui,
-                                "simple_q_seg",
-                                &mut self.config.simple_quality,
-                                &[
-                                    (SimpleQuality::Balanced, "Alta Calidad (ResNet50)"),
-                                    (SimpleQuality::Fast, "Ultra Rápido (MobileNetV3)"),
-                                ],
+                                &mut self.config.auto_bgr,
+                                "Sin foto previa (reconstruir fondo auto)",
                             );
-                            if q_seg.changed() {
+                            if auto_tog.changed() {
                                 self.config.save();
                             }
-                            smooth_tooltip(
-                                ui,
-                                &q_seg,
-                                "Calidad vs Velocidad",
-                                "Alta Calidad ofrece bordes y cabello excelentes.\nUltra Rápido procesa a máxima velocidad con menor uso de VRAM.",
-                            );
-                        } else {
-                            self.render_bgmv2_bgr_picker(ui, ctx);
+                            if !self.config.auto_bgr {
+                                self.render_bgmv2_bgr_picker(ui, ctx);
+                            }
                             self.render_checkpoint_picker(ui);
                         }
 
@@ -1016,6 +1228,8 @@ impl RemBackApp {
                             "CUDA usa tu tarjeta gráfica NVIDIA para procesar mucho más rápido (FP16 automático).",
                         );
                     });
+
+                    self.render_mask_tuning_card(ui);
                     return;
                 }
 
@@ -1338,7 +1552,10 @@ impl RemBackApp {
                     );
                 }
 
-                // 4. Salida y Formato
+                // 4. Ajuste de máscara
+                self.render_mask_tuning_card(ui);
+
+                // 5. Salida y Formato
                 glass_card(ui, "card_output", "Salidas y Formato", None, |ui| {
                     ui.label(RichText::new("Formato de exportación").size(12.5).color(Palette::TEXT_SECONDARY));
                     let fmt_seg = segmented_control(
@@ -1408,7 +1625,7 @@ impl RemBackApp {
                     });
 
                     ui.add_space(6.0);
-                    ui.allocate_ui(vec2(235.0, 30.0), |ui| {
+                    ui.allocate_ui(vec2(265.0, 30.0), |ui| {
                         let ls = if self.config.engine_mode == EngineMode::AutoNoRef {
                             if matches!(
                                 self.config.preview_layer,
@@ -1421,9 +1638,9 @@ impl RemBackApp {
                                 "layer_seg_rvm",
                                 &mut self.config.preview_layer,
                                 &[
-                                    (OutputLayer::Com, "com"),
-                                    (OutputLayer::Pha, "pha"),
-                                    (OutputLayer::Fgr, "fgr"),
+                                    (OutputLayer::Com, "Color"),
+                                    (OutputLayer::Pha, "Máscara"),
+                                    (OutputLayer::Fgr, "Sujeto"),
                                 ],
                             )
                         } else {
@@ -1432,19 +1649,22 @@ impl RemBackApp {
                                 "layer_seg",
                                 &mut self.config.preview_layer,
                                 &[
-                                    (OutputLayer::Com, "com"),
-                                    (OutputLayer::Pha, "pha"),
-                                    (OutputLayer::Fgr, "fgr"),
-                                    (OutputLayer::Err, "err"),
-                                    (OutputLayer::Ref, "ref"),
+                                    (OutputLayer::Com, "Color"),
+                                    (OutputLayer::Pha, "Máscara"),
+                                    (OutputLayer::Fgr, "Sujeto"),
+                                    (OutputLayer::Err, "Error"),
+                                    (OutputLayer::Ref, "Refin."),
                                 ],
                             )
                         };
+                        if ls.changed() {
+                            self.config.save();
+                        }
                         smooth_tooltip(
                             ui,
                             &ls,
-                            "Capa de vista previa",
-                            "Elige qué salida del modelo inspeccionar al generar la vista previa.",
+                            "Capa de vista previa (cambio instantáneo)",
+                            "Color: resultado con fondo verde/transparente.\nMáscara: silueta blanco y negro.\nSujeto: colores puros.\nCambia al instante sin recalcular.",
                         );
                     });
 
@@ -1510,7 +1730,8 @@ impl RemBackApp {
         );
 
         let inner_rect = canvas_rect.shrink(10.0);
-        let active_tex = self.preview_out_tex.as_ref().or(self.preview_src_tex.as_ref());
+        let out_tex_opt = self.active_preview_out_tex().cloned();
+        let active_tex = out_tex_opt.as_ref().or(self.preview_src_tex.as_ref());
 
         if let Some(tex) = active_tex {
             let tex_sz = tex.size_vec2();
@@ -1536,12 +1757,12 @@ impl RemBackApp {
                 PreviewViewMode::Original => {
                     if let Some(src) = &self.preview_src_tex {
                         painter.image(src.id(), draw_rect, full_uv, tint);
-                    } else if let Some(out) = &self.preview_out_tex {
+                    } else if let Some(out) = &out_tex_opt {
                         painter.image(out.id(), draw_rect, full_uv, tint);
                     }
                 }
                 PreviewViewMode::Result => {
-                    if let Some(out) = &self.preview_out_tex {
+                    if let Some(out) = &out_tex_opt {
                         painter.image(out.id(), draw_rect, full_uv, tint);
                     } else if let Some(src) = &self.preview_src_tex {
                         painter.image(src.id(), draw_rect, full_uv, tint);
@@ -1573,7 +1794,7 @@ impl RemBackApp {
                         );
                         painter.image(src.id(), left_rect, left_uv, tint);
                     }
-                    if let Some(out) = &self.preview_out_tex {
+                    if let Some(out) = &out_tex_opt {
                         let right_rect = Rect::from_min_max(
                             pos2(split_x, draw_rect.top()),
                             draw_rect.max,
@@ -2020,31 +2241,15 @@ impl RemBackApp {
 
                             ui.add_space(8.0);
 
-                            // Section 3: Pretrained Checkpoints (.pth)
-                            glass_card(ui, "upd_models", "3. Modelos Preentrenados (.pth)", None, |ui| {
-                                let assets: Vec<ModelAssetInfo> = self
+                            // Section 3: Pretrained Models (RVM + BackgroundMattingV2)
+                            glass_card(ui, "upd_models", "3. Modelos Descargables (RVM y BGMv2)", None, |ui| {
+                                let mut assets: Vec<ModelAssetInfo> = rvm_model_assets();
+                                let bgm_assets: Vec<ModelAssetInfo> = self
                                     .remote_info
                                     .as_ref()
                                     .map(|r| r.models.clone())
-                                    .unwrap_or_else(|| {
-                                        vec![
-                                            ModelAssetInfo {
-                                                name: "pytorch_mobilenetv2.pth".into(),
-                                                url: "https://github.com/PeterL1n/BackgroundMattingV2/releases/download/v1.0.0/pytorch_mobilenetv2.pth".into(),
-                                                size_bytes: 18_700_000,
-                                            },
-                                            ModelAssetInfo {
-                                                name: "pytorch_resnet50.pth".into(),
-                                                url: "https://github.com/PeterL1n/BackgroundMattingV2/releases/download/v1.0.0/pytorch_resnet50.pth".into(),
-                                                size_bytes: 158_000_000,
-                                            },
-                                            ModelAssetInfo {
-                                                name: "pytorch_resnet101.pth".into(),
-                                                url: "https://github.com/PeterL1n/BackgroundMattingV2/releases/download/v1.0.0/pytorch_resnet101.pth".into(),
-                                                size_bytes: 233_000_000,
-                                            },
-                                        ]
-                                    });
+                                    .unwrap_or_else(default_models_fallback);
+                                assets.extend(bgm_assets);
 
                                 for asset in assets {
                                     let local_path = self.paths.models_dir.join(&asset.name);
@@ -2060,12 +2265,27 @@ impl RemBackApp {
                                             if exists {
                                                 badge_pill(ui, "Descargado", Palette::EMERALD);
                                                 if secondary_button(ui, "Usar", true).clicked() {
-                                                    self.config.model_checkpoint =
-                                                        local_path.to_string_lossy().into_owned();
+                                                    if asset.name.ends_with(".torchscript") {
+                                                        self.config.engine_mode =
+                                                            EngineMode::AutoNoRef;
+                                                        self.config.simple_quality =
+                                                            if asset.name.contains("mobilenet") {
+                                                                SimpleQuality::Fast
+                                                            } else {
+                                                                SimpleQuality::Balanced
+                                                            };
+                                                    } else {
+                                                        self.config.engine_mode =
+                                                            EngineMode::BgMattingV2;
+                                                        self.config.model_checkpoint = local_path
+                                                            .to_string_lossy()
+                                                            .into_owned();
+                                                        self.sync_backbone_from_checkpoint();
+                                                    }
                                                     self.config.save();
                                                     self.push_toast(
                                                         ctx,
-                                                        format!("Checkpoint activo: {}", asset.name),
+                                                        format!("Modelo activo: {}", asset.name),
                                                         false,
                                                     );
                                                 }

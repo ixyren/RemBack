@@ -36,6 +36,11 @@ pub enum WorkerEvent {
         height: u32,
         src_path: String,
         out_path: String,
+        com_path: String,
+        pha_path: String,
+        fgr_path: String,
+        err_path: String,
+        ref_path: String,
     },
     Progress {
         frame: u32,
@@ -76,6 +81,16 @@ enum RawWorkerMsg {
         height: u32,
         src_path: String,
         out_path: String,
+        #[serde(default)]
+        com_path: String,
+        #[serde(default)]
+        pha_path: String,
+        #[serde(default)]
+        fgr_path: String,
+        #[serde(default)]
+        err_path: String,
+        #[serde(default)]
+        ref_path: String,
     },
     #[serde(rename = "progress")]
     Progress {
@@ -234,6 +249,11 @@ fn spawn_python_worker(
                             height,
                             src_path,
                             out_path,
+                            com_path,
+                            pha_path,
+                            fgr_path,
+                            err_path,
+                            ref_path,
                         } => {
                             saw_error_or_done = true;
                             WorkerEvent::PreviewDone {
@@ -242,6 +262,11 @@ fn spawn_python_worker(
                                 height,
                                 src_path,
                                 out_path,
+                                com_path,
+                                pha_path,
+                                fgr_path,
+                                err_path,
+                                ref_path,
                             }
                         }
                         RawWorkerMsg::Progress {
@@ -349,9 +374,19 @@ fn build_common_args(cfg: &MattingConfig, paths: &UpdaterPaths) -> Vec<String> {
         cfg.refine_kernel_size.to_string(),
         "--device".into(),
         cfg.device.as_arg().into(),
+        "--mask-tolerance".into(),
+        format!("{:.3}", cfg.mask_tolerance),
+        "--mask-softness".into(),
+        format!("{:.3}", cfg.mask_softness),
+        "--mask-expand".into(),
+        cfg.mask_expand.to_string(),
         "--preview-dir".into(),
         paths.preview_dir.to_string_lossy().into_owned(),
     ];
+
+    if cfg.mask_clean_artifacts {
+        args.push("--mask-clean-artifacts".into());
+    }
 
     if cfg.use_fp16 && cfg.device == ComputeDevice::Cuda {
         args.push("--fp16".into());
