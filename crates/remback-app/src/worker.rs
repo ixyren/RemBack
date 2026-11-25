@@ -155,6 +155,9 @@ fn spawn_python_worker(
         cmd.arg("-u")
             .arg(&script)
             .args(&args)
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

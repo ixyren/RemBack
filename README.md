@@ -27,7 +27,7 @@ Permite eliminar el fondo de videos o reemplazarlo por pantalla verde, transpare
 
 ## Instalación (Windows)
 
-1. Descarga **`RemBack-v1.2.0-Setup.exe`** desde la sección [Releases](https://github.com/ixyren/RemBack/releases/latest).
+1. Descarga **`RemBack-v1.2.1-Setup.exe`** desde la sección [Releases](https://github.com/ixyren/RemBack/releases/latest).
 2. Ejecuta el instalador (si ya tienes una versión anterior, la detectará y la actualizará automáticamente).
 3. Al abrir **RemBack**, haz clic en **Actualizaciones** si aún no tienes configurado el entorno Python/PyTorch.
 
@@ -45,7 +45,7 @@ powershell -ExecutionPolicy Bypass -File .\build_release.ps1
 
 Genera:
 - `target\release\remback.exe`
-- `dist\RemBack-v1.2.0-Setup.exe`
+- `dist\RemBack-v1.2.1-Setup.exe`
 
 ---
 

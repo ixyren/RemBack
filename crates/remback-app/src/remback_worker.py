@@ -22,7 +22,19 @@ RVM_BASE_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download
 
 
 def emit(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    line = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+    try:
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            buf.write(line)
+            buf.flush()
+            return
+    except OSError:
+        pass
+    try:
+        os.write(1, line)
+    except OSError:
+        pass
 
 
 def emit_stage(progress: float, message: str) -> None:
