@@ -13,8 +13,8 @@ use remback_ui::{
 };
 
 use crate::config::{
-    Backbone, BgMode, ComputeDevice, EngineMode, MattingConfig, ModelType, OutputFormat,
-    OutputLayer, RefineMode, SimpleQuality, UiMode,
+    Backbone, BgMode, ComputeDevice, DepthMode, EngineMode, MattingConfig, ModelType,
+    OutputFormat, OutputLayer, RefineMode, SimpleQuality, UiMode,
 };
 use crate::updater::{
     check_bgmv2_updates, default_models_fallback, download_and_launch_app_update,
@@ -59,6 +59,7 @@ pub struct RemBackApp {
     preview_com_tex: Option<TextureHandle>,
     preview_pha_tex: Option<TextureHandle>,
     preview_fgr_tex: Option<TextureHandle>,
+    preview_depth_tex: Option<TextureHandle>,
     preview_err_tex: Option<TextureHandle>,
     preview_ref_tex: Option<TextureHandle>,
     preview_fade_start: Option<f64>,
@@ -143,6 +144,7 @@ impl RemBackApp {
             preview_com_tex: None,
             preview_pha_tex: None,
             preview_fgr_tex: None,
+            preview_depth_tex: None,
             preview_err_tex: None,
             preview_ref_tex: None,
             preview_fade_start: None,
@@ -232,6 +234,7 @@ impl RemBackApp {
                     com_path,
                     pha_path,
                     fgr_path,
+                    depth_path,
                     err_path,
                     ref_path,
                 } => {
@@ -251,6 +254,11 @@ impl RemBackApp {
                         None
                     } else {
                         Self::load_png_texture(ctx, "remback_fgr", &fgr_path)
+                    };
+                    self.preview_depth_tex = if depth_path.is_empty() {
+                        None
+                    } else {
+                        Self::load_png_texture(ctx, "remback_depth", &depth_path)
                     };
                     self.preview_err_tex = if err_path.is_empty() {
                         None
@@ -475,6 +483,9 @@ impl RemBackApp {
     }
 
     fn engine_ready(&self) -> bool {
+        if self.config.depth_mode == DepthMode::DepthOnly {
+            return self.paths.is_venv_ready();
+        }
         match self.config.engine_mode {
             EngineMode::AutoNoRef => self.paths.is_venv_ready(),
             EngineMode::BgMattingV2 => {
@@ -494,12 +505,95 @@ impl RemBackApp {
             OutputLayer::Com => self.preview_com_tex.as_ref(),
             OutputLayer::Pha => self.preview_pha_tex.as_ref(),
             OutputLayer::Fgr => self.preview_fgr_tex.as_ref(),
+            OutputLayer::Depth => self.preview_depth_tex.as_ref(),
             OutputLayer::Err => self.preview_err_tex.as_ref(),
             OutputLayer::Ref => self.preview_ref_tex.as_ref(),
         };
         preferred
             .or(self.preview_com_tex.as_ref())
             .or(self.preview_out_tex.as_ref())
+    }
+
+    fn render_depth_card(&mut self, ui: &mut Ui) {
+        let badge = match self.config.depth_mode {
+            DepthMode::Off => None,
+            DepthMode::Hybrid => Some("Híbrido"),
+            DepthMode::DepthOnly => Some("Profundidad"),
+        };
+        glass_card(ui, "card_depth_mode", "Mapa de Profundidad (Depth Anything V2)", badge, |ui| {
+            let mut changed = false;
+            let d_seg = segmented_control(
+                ui,
+                "depth_mode_seg",
+                &mut self.config.depth_mode,
+                &[
+                    (DepthMode::Off, "Desactivado"),
+                    (DepthMode::Hybrid, "Híbrido"),
+                    (DepthMode::DepthOnly, "Solo Profundidad"),
+                ],
+            );
+            if d_seg.changed() {
+                changed = true;
+            }
+            smooth_tooltip(
+                ui,
+                &d_seg,
+                "Recorte por Mapa de Profundidad",
+                "Desactivado: usa solo el modelo de matting.\nHíbrido: combina cabello/bordes finos con distancia real para borrar personas u objetos de atrás.\nSolo Profundidad: recorta cualquier objeto o sujeto por cercanía a la cámara.",
+            );
+
+            if self.config.depth_mode != DepthMode::Off {
+                let mut cut_pct = (self.config.depth_cutoff * 100.0).round() as u32;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Distancia de corte:")
+                            .size(12.5)
+                            .color(Palette::TEXT_SECONDARY),
+                    );
+                    let sl = smooth_slider(ui, &mut cut_pct, 0..=95, "%");
+                    if sl.changed() {
+                        self.config.depth_cutoff = (cut_pct as f32) / 100.0;
+                        changed = true;
+                    }
+                    smooth_tooltip(
+                        ui,
+                        &sl,
+                        "Plano de corte en profundidad",
+                        "Valores altos recortan solo lo que está muy cerca de la cámara; valores bajos incluyen planos más lejanos.",
+                    );
+                });
+
+                let mut soft_pct = (self.config.depth_softness * 100.0).round() as u32;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Transición profundidad:")
+                            .size(12.5)
+                            .color(Palette::TEXT_SECONDARY),
+                    );
+                    let sl = smooth_slider(ui, &mut soft_pct, 2..=100, "%");
+                    if sl.changed() {
+                        self.config.depth_softness = (soft_pct as f32) / 100.0;
+                        changed = true;
+                    }
+                    smooth_tooltip(
+                        ui,
+                        &sl,
+                        "Rango de transición",
+                        "Suaviza la caída del recorte entre el plano cercano y el fondo lejano.",
+                    );
+                });
+
+                ui.label(
+                    RichText::new("Activa la capa 'Profundidad' arriba para inspeccionar el mapa 3D.")
+                        .size(11.0)
+                        .color(Palette::CYAN),
+                );
+            }
+
+            if changed {
+                self.config.save();
+            }
+        });
     }
 
     fn render_mask_tuning_card(&mut self, ui: &mut Ui) {
@@ -1229,6 +1323,7 @@ impl RemBackApp {
                         );
                     });
 
+                    self.render_depth_card(ui);
                     self.render_mask_tuning_card(ui);
                     return;
                 }
@@ -1552,7 +1647,8 @@ impl RemBackApp {
                     );
                 }
 
-                // 4. Ajuste de máscara
+                // 4. Profundidad y Ajuste de máscara
+                self.render_depth_card(ui);
                 self.render_mask_tuning_card(ui);
 
                 // 5. Salida y Formato
@@ -1583,13 +1679,19 @@ impl RemBackApp {
                         smooth_tooltip(ui, &r2, "Máscara Alpha (pha)", "Máscara en escala de grises de transparencia.");
                         let r3 = smooth_toggle(ui, &mut self.config.out_fgr, "fgr");
                         smooth_tooltip(ui, &r3, "Primer Plano (fgr)", "Colores estimados del sujeto sin contaminación del fondo.");
-                        if self.config.engine_mode == EngineMode::BgMattingV2 {
+                        if self.config.depth_mode != DepthMode::DepthOnly
+                            && self.config.engine_mode == EngineMode::BgMattingV2
+                        {
                             let r4 = smooth_toggle(ui, &mut self.config.out_err, "err");
                             smooth_tooltip(ui, &r4, "Mapa de Error (err)", "Mapa de incertidumbre de la red base.");
                             ui.add_enabled_ui(is_refine, |ui| {
                                 let r5 = smooth_toggle(ui, &mut self.config.out_ref, "ref");
                                 smooth_tooltip(ui, &r5, "Mapa de Refinamiento (ref)", "Zonas seleccionadas para refinado HD (solo MattingRefine).");
                             });
+                        }
+                        if self.config.depth_mode != DepthMode::Off {
+                            let r6 = smooth_toggle(ui, &mut self.config.out_depth, "depth");
+                            smooth_tooltip(ui, &r6, "Mapa de Profundidad (depth)", "Visualización a color del mapa de distancia Depth Anything V2.");
                         }
                     });
                 });
@@ -1625,22 +1727,66 @@ impl RemBackApp {
                     });
 
                     ui.add_space(6.0);
-                    ui.allocate_ui(vec2(265.0, 30.0), |ui| {
-                        let ls = if self.config.engine_mode == EngineMode::AutoNoRef {
+                    let show_depth = self.config.depth_mode != DepthMode::Off
+                        || self.preview_depth_tex.is_some();
+                    let layer_w = if self.config.engine_mode == EngineMode::BgMattingV2
+                        && self.config.depth_mode != DepthMode::DepthOnly
+                    {
+                        if show_depth { 360.0 } else { 300.0 }
+                    } else if show_depth {
+                        290.0
+                    } else {
+                        230.0
+                    };
+                    ui.allocate_ui(vec2(layer_w, 30.0), |ui| {
+                        let ls = if self.config.depth_mode == DepthMode::DepthOnly
+                            || self.config.engine_mode == EngineMode::AutoNoRef
+                        {
                             if matches!(
                                 self.config.preview_layer,
                                 OutputLayer::Err | OutputLayer::Ref
                             ) {
                                 self.config.preview_layer = OutputLayer::Com;
                             }
+                            if !show_depth && self.config.preview_layer == OutputLayer::Depth {
+                                self.config.preview_layer = OutputLayer::Com;
+                            }
+                            if show_depth {
+                                segmented_control(
+                                    ui,
+                                    "layer_seg_rvm_d",
+                                    &mut self.config.preview_layer,
+                                    &[
+                                        (OutputLayer::Com, "Color"),
+                                        (OutputLayer::Pha, "Máscara"),
+                                        (OutputLayer::Fgr, "Sujeto"),
+                                        (OutputLayer::Depth, "Profundidad"),
+                                    ],
+                                )
+                            } else {
+                                segmented_control(
+                                    ui,
+                                    "layer_seg_rvm",
+                                    &mut self.config.preview_layer,
+                                    &[
+                                        (OutputLayer::Com, "Color"),
+                                        (OutputLayer::Pha, "Máscara"),
+                                        (OutputLayer::Fgr, "Sujeto"),
+                                    ],
+                                )
+                            }
+                        } else if show_depth {
                             segmented_control(
                                 ui,
-                                "layer_seg_rvm",
+                                "layer_seg_d",
                                 &mut self.config.preview_layer,
                                 &[
                                     (OutputLayer::Com, "Color"),
                                     (OutputLayer::Pha, "Máscara"),
                                     (OutputLayer::Fgr, "Sujeto"),
+                                    (OutputLayer::Depth, "Profund."),
+                                    (OutputLayer::Err, "Error"),
+                                    (OutputLayer::Ref, "Refin."),
                                 ],
                             )
                         } else {
@@ -1664,7 +1810,7 @@ impl RemBackApp {
                             ui,
                             &ls,
                             "Capa de vista previa (cambio instantáneo)",
-                            "Color: resultado con fondo verde/transparente.\nMáscara: silueta blanco y negro.\nSujeto: colores puros.\nCambia al instante sin recalcular.",
+                            "Color: resultado con fondo verde/transparente.\nMáscara: silueta blanco y negro.\nSujeto: colores puros.\nProfundidad: mapa de distancia 3D.\nCambia al instante sin recalcular.",
                         );
                     });
 
@@ -1962,15 +2108,7 @@ impl RemBackApp {
                                 BgMode::CustomColor => "Color sólido",
                                 BgMode::TargetMedia => "Fondo personalizado",
                             };
-                            let engine_lbl = match self.config.engine_mode {
-                                EngineMode::AutoNoRef => format!(
-                                    "Auto ({})",
-                                    self.config.simple_quality.rvm_backbone_arg()
-                                ),
-                                EngineMode::BgMattingV2 => {
-                                    format!("BGMv2 {}", self.config.model_type.as_arg())
-                                }
-                            };
+                            let engine_lbl = self.config.active_model_display();
                             ui.label(
                                 RichText::new(format!(
                                     "{engine_lbl} · {bg_str} · Capas: [{layers}]"

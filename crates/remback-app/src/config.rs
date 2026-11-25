@@ -154,10 +154,28 @@ impl OutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DepthMode {
+    Off,
+    Hybrid,
+    DepthOnly,
+}
+
+impl DepthMode {
+    pub fn as_arg(&self) -> &'static str {
+        match self {
+            DepthMode::Off => "off",
+            DepthMode::Hybrid => "hybrid",
+            DepthMode::DepthOnly => "only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputLayer {
     Com,
     Pha,
     Fgr,
+    Depth,
     Err,
     Ref,
 }
@@ -168,6 +186,7 @@ impl OutputLayer {
             OutputLayer::Com => "com",
             OutputLayer::Pha => "pha",
             OutputLayer::Fgr => "fgr",
+            OutputLayer::Depth => "depth",
             OutputLayer::Err => "err",
             OutputLayer::Ref => "ref",
         }
@@ -212,6 +231,11 @@ pub struct MattingConfig {
     pub out_fgr: bool,
     pub out_err: bool,
     pub out_ref: bool,
+    pub out_depth: bool,
+
+    pub depth_mode: DepthMode,
+    pub depth_cutoff: f32,
+    pub depth_softness: f32,
 
     pub mask_tolerance: f32,
     pub mask_softness: f32,
@@ -271,6 +295,11 @@ impl Default for MattingConfig {
             out_fgr: false,
             out_err: false,
             out_ref: false,
+            out_depth: false,
+
+            depth_mode: DepthMode::Off,
+            depth_cutoff: 0.40,
+            depth_softness: 0.15,
 
             mask_tolerance: 0.25,
             mask_softness: 0.25,
@@ -331,14 +360,21 @@ impl MattingConfig {
         if self.out_fgr {
             types.push("fgr");
         }
-        if self.out_err && self.engine_mode == EngineMode::BgMattingV2 {
+        if self.out_err
+            && self.depth_mode != DepthMode::DepthOnly
+            && self.engine_mode == EngineMode::BgMattingV2
+        {
             types.push("err");
         }
         if self.out_ref
+            && self.depth_mode != DepthMode::DepthOnly
             && self.engine_mode == EngineMode::BgMattingV2
             && self.model_type == ModelType::MattingRefine
         {
             types.push("ref");
+        }
+        if self.out_depth && self.depth_mode != DepthMode::Off {
+            types.push("depth");
         }
         if types.is_empty() {
             types.push("com");
@@ -348,7 +384,10 @@ impl MattingConfig {
 
     /// Clear human-readable label of the exact model/file that will execute.
     pub fn active_model_display(&self) -> String {
-        match self.engine_mode {
+        if self.depth_mode == DepthMode::DepthOnly {
+            return "Depth Anything V2 Small (Solo Profundidad)".into();
+        }
+        let base = match self.engine_mode {
             EngineMode::AutoNoRef => {
                 let prec = if self.use_fp16 && self.device == ComputeDevice::Cuda {
                     "fp16"
@@ -369,6 +408,11 @@ impl MattingConfig {
                     .unwrap_or("sin checkpoint .pth");
                 format!("{ckpt_name} (BackgroundMattingV2)")
             }
+        };
+        if self.depth_mode == DepthMode::Hybrid {
+            format!("{base} + Depth Anything V2")
+        } else {
+            base
         }
     }
 
@@ -386,7 +430,7 @@ impl MattingConfig {
         if self.video_src.trim().is_empty() || !Path::new(&self.video_src).is_file() {
             return Err("Selecciona un archivo de video de origen válido (--video-src).".into());
         }
-        if self.engine_mode == EngineMode::BgMattingV2 {
+        if self.depth_mode != DepthMode::DepthOnly && self.engine_mode == EngineMode::BgMattingV2 {
             if !self.auto_bgr
                 && (self.video_bgr.trim().is_empty() || !Path::new(&self.video_bgr).is_file())
             {
@@ -526,6 +570,31 @@ mod tests {
         cfg.out_ref = true;
         let types = cfg.selected_output_types();
         assert_eq!(types, vec!["com"]);
+    }
+
+    #[test]
+    fn depth_modes_and_validation() {
+        let tmp_dir = std::env::temp_dir().join("remback_depth_cfg_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let vid = tmp_dir.join("dummy.mp4");
+        std::fs::write(&vid, b"0").unwrap();
+
+        let mut cfg = MattingConfig::default();
+        assert_eq!(cfg.depth_mode, DepthMode::Off);
+        cfg.video_src = vid.to_string_lossy().into_owned();
+        cfg.engine_mode = EngineMode::BgMattingV2;
+        cfg.model_checkpoint.clear();
+        assert!(cfg.validate(false).is_err());
+
+        cfg.depth_mode = DepthMode::DepthOnly;
+        assert!(cfg.validate(false).is_ok());
+        assert!(cfg.active_model_display().contains("Solo Profundidad"));
+
+        cfg.depth_mode = DepthMode::Hybrid;
+        cfg.engine_mode = EngineMode::AutoNoRef;
+        assert!(cfg.active_model_display().contains("Depth Anything V2"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

@@ -872,7 +872,7 @@ pub fn setup_python_environment(paths: UpdaterPaths, force_reinstall: bool) -> R
 
         let _ = tx.send(UpdaterEvent::Progress(
             0.80,
-            "Instalando OpenCV, Pillow y dependencias de video...".into(),
+            "Instalando OpenCV, Pillow, Transformers y dependencias...".into(),
         ));
         if let Err(e) = run_logged_cmd(
             &vpy,
@@ -884,6 +884,7 @@ pub fn setup_python_environment(paths: UpdaterPaths, force_reinstall: bool) -> R
                 "opencv-python",
                 "pillow",
                 "tqdm",
+                "transformers",
             ],
             &tx,
         ) {

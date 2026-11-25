@@ -10,7 +10,7 @@ use std::thread;
 
 use serde::Deserialize;
 
-use crate::config::{ComputeDevice, EngineMode, MattingConfig};
+use crate::config::{ComputeDevice, DepthMode, EngineMode, MattingConfig};
 use crate::updater::UpdaterPaths;
 
 const WORKER_PY: &str = include_str!("remback_worker.py");
@@ -39,6 +39,7 @@ pub enum WorkerEvent {
         com_path: String,
         pha_path: String,
         fgr_path: String,
+        depth_path: String,
         err_path: String,
         ref_path: String,
     },
@@ -87,6 +88,8 @@ enum RawWorkerMsg {
         pha_path: String,
         #[serde(default)]
         fgr_path: String,
+        #[serde(default)]
+        depth_path: String,
         #[serde(default)]
         err_path: String,
         #[serde(default)]
@@ -252,6 +255,7 @@ fn spawn_python_worker(
                             com_path,
                             pha_path,
                             fgr_path,
+                            depth_path,
                             err_path,
                             ref_path,
                         } => {
@@ -265,6 +269,7 @@ fn spawn_python_worker(
                                 com_path,
                                 pha_path,
                                 fgr_path,
+                                depth_path,
                                 err_path,
                                 ref_path,
                             }
@@ -374,6 +379,12 @@ fn build_common_args(cfg: &MattingConfig, paths: &UpdaterPaths) -> Vec<String> {
         cfg.refine_kernel_size.to_string(),
         "--device".into(),
         cfg.device.as_arg().into(),
+        "--depth-mode".into(),
+        cfg.depth_mode.as_arg().into(),
+        "--depth-cutoff".into(),
+        format!("{:.3}", cfg.depth_cutoff),
+        "--depth-softness".into(),
+        format!("{:.3}", cfg.depth_softness),
         "--mask-tolerance".into(),
         format!("{:.3}", cfg.mask_tolerance),
         "--mask-softness".into(),
@@ -453,7 +464,10 @@ pub fn run_preview(paths: &UpdaterPaths, cfg: &MattingConfig) -> Result<WorkerHa
     let python = paths
         .active_python()
         .ok_or_else(|| "Entorno Python no configurado. Ábrelo desde 'Actualizaciones'.".to_owned())?;
-    if cfg.engine_mode == EngineMode::BgMattingV2 && !paths.is_bgmv2_installed() {
+    if cfg.depth_mode != DepthMode::DepthOnly
+        && cfg.engine_mode == EngineMode::BgMattingV2
+        && !paths.is_bgmv2_installed()
+    {
         return Err("BackgroundMattingV2 no está descargado. Instálalo en 'Actualizaciones'.".into());
     }
     let script = ensure_worker_script(paths)?;
@@ -473,7 +487,10 @@ pub fn run_export(paths: &UpdaterPaths, cfg: &MattingConfig) -> Result<WorkerHan
     let python = paths
         .active_python()
         .ok_or_else(|| "Entorno Python no configurado. Ábrelo desde 'Actualizaciones'.".to_owned())?;
-    if cfg.engine_mode == EngineMode::BgMattingV2 && !paths.is_bgmv2_installed() {
+    if cfg.depth_mode != DepthMode::DepthOnly
+        && cfg.engine_mode == EngineMode::BgMattingV2
+        && !paths.is_bgmv2_installed()
+    {
         return Err("BackgroundMattingV2 no está descargado. Instálalo en 'Actualizaciones'.".into());
     }
     let script = ensure_worker_script(paths)?;

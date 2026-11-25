@@ -67,10 +67,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     p.add_argument("--preprocess-alignment", action="store_true")
     p.add_argument("--output-dir", default="")
-    p.add_argument("--output-types", nargs="+", default=["com"], choices=["com", "pha", "fgr", "err", "ref"])
+    p.add_argument("--output-types", nargs="+", default=["com"], choices=["com", "pha", "fgr", "err", "ref", "depth"])
     p.add_argument("--output-format", default="video", choices=["video", "image_sequences"])
     p.add_argument("--frame-index", type=int, default=0)
-    p.add_argument("--preview-layer", default="com", choices=["com", "pha", "fgr", "err", "ref"])
+    p.add_argument("--preview-layer", default="com", choices=["com", "pha", "fgr", "depth", "err", "ref"])
+    p.add_argument("--depth-mode", default="off", choices=["off", "hybrid", "only"])
+    p.add_argument("--depth-cutoff", type=float, default=0.40)
+    p.add_argument("--depth-softness", type=float, default=0.15)
     p.add_argument("--mask-tolerance", type=float, default=0.25)
     p.add_argument("--mask-softness", type=float, default=0.25)
     p.add_argument("--mask-expand", type=int, default=0)
@@ -643,8 +646,10 @@ def setup_writers(args, fps: float, w: int, h: int, allow_ref: bool):
     out_types = list(args.output_types)
     if "ref" in out_types and not allow_ref:
         out_types.remove("ref")
-    if "err" in out_types and args.engine == "rvm":
+    if "err" in out_types and (args.engine == "rvm" or args.depth_mode == "only"):
         out_types.remove("err")
+    if "depth" in out_types and args.depth_mode == "off":
+        out_types.remove("depth")
     if not out_types:
         out_types = ["com"]
 
@@ -666,6 +671,250 @@ def setup_writers(args, fps: float, w: int, h: int, allow_ref: bool):
     return writers
 
 
+class DepthEstimator:
+    """Monocular depth estimator powered by Depth-Anything-V2-Small-hf."""
+
+    MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
+
+    def __init__(self, torch, device, models_dir: str, use_fp16: bool, stage_start: float = 0.35, stage_end: float = 0.55):
+        import subprocess
+
+        self.torch = torch
+        self.F = torch.nn.functional
+        self.device = device
+        self.use_half = bool(use_fp16 and device.type == "cuda")
+        self.dtype = torch.float16 if self.use_half else torch.float32
+
+        hf_cache = os.path.join(models_dir, "hf_cache")
+        os.makedirs(hf_cache, exist_ok=True)
+        os.environ["HF_HOME"] = hf_cache
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+        try:
+            from transformers import AutoModelForDepthEstimation
+        except ImportError:
+            emit_stage(stage_start, "Instalando módulo transformers para profundidad...")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "transformers"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            from transformers import AutoModelForDepthEstimation
+
+        emit_stage((stage_start + stage_end) * 0.5, "Cargando modelo de profundidad Depth Anything V2...")
+        self.model = AutoModelForDepthEstimation.from_pretrained(self.MODEL_ID, cache_dir=hf_cache)
+        self.model = self.model.to(device).eval()
+        if self.use_half:
+            self.model = self.model.half()
+
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=self.dtype).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=self.dtype).view(1, 3, 1, 1)
+        self.ema_min = None
+        self.ema_max = None
+        emit_stage(stage_end, "Modelo de profundidad listo.")
+
+    def predict(self, src_t, cutoff: float, softness: float, want_vis: bool = False):
+        h, w = src_t.shape[2], src_t.shape[3]
+        inp = self.F.interpolate(src_t.float(), size=(518, 518), mode="bilinear", align_corners=False).to(self.dtype)
+        inp = (inp - self.mean) / self.std
+
+        pred = self.model(pixel_values=inp).predicted_depth
+        if pred.ndim == 3:
+            pred = pred.unsqueeze(1)
+        pred_f = pred.float()
+
+        cur_min = float(self.torch.quantile(pred_f.flatten(), 0.01).item())
+        cur_max = float(self.torch.quantile(pred_f.flatten(), 0.99).item())
+        if self.ema_min is None:
+            self.ema_min = cur_min
+            self.ema_max = cur_max
+        else:
+            self.ema_min = 0.85 * self.ema_min + 0.15 * cur_min
+            self.ema_max = 0.85 * self.ema_max + 0.15 * cur_max
+
+        depth_up = self.F.interpolate(pred_f, size=(h, w), mode="bilinear", align_corners=False)
+        denom = max(1e-4, self.ema_max - self.ema_min)
+        depth_norm = ((depth_up - self.ema_min) / denom).clamp(0.0, 1.0)
+
+        soft = max(0.02, float(softness))
+        mask = ((depth_norm - float(cutoff)) / soft).clamp(0.0, 1.0).to(src_t.dtype)
+
+        vis_t = None
+        if want_vis:
+            import cv2
+
+            d_u8 = depth_norm[0, 0].mul(255).byte().cpu().numpy()
+            col_bgr = cv2.applyColorMap(d_u8, cv2.COLORMAP_INFERNO)
+            col_rgb = cv2.cvtColor(col_bgr, cv2.COLOR_BGR2RGB)
+            vis_t = self.torch.from_numpy(col_rgb).to(src_t.device).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+
+        return mask, vis_t
+
+
+def handle_preview_depth_only(args: argparse.Namespace) -> None:
+    import cv2
+
+    emit_stage(0.08, "Cargando PyTorch y mapa de profundidad...")
+    import torch
+
+    device = resolve_device(torch, args.device)
+    use_fp16 = bool(args.fp16 and device.type == "cuda")
+    dtype = torch.float16 if use_fp16 else torch.float32
+    models_dir = resolve_models_dir(args)
+    depth_est = DepthEstimator(torch, device, models_dir, use_fp16, stage_start=0.14, stage_end=0.60)
+
+    info = probe_video(args.video_src)
+    w = args.video_resize[0] if args.video_resize else info["width"]
+    h = args.video_resize[1] if args.video_resize else info["height"]
+    idx = max(0, min(args.frame_index, info["frame_count"] - 1))
+
+    emit_stage(0.68, "Leyendo fotograma de video...")
+    cap = cv2.VideoCapture(args.video_src)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+    ok, frame_bgr = cap.read()
+    cap.release()
+    if not ok or frame_bgr is None:
+        raise RuntimeError(f"No se pudo leer el fotograma {idx}")
+
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    if rgb.shape[1] != w or rgb.shape[0] != h:
+        rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    src_t = torch.from_numpy(rgb).to(device).permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
+    solid_bg = parse_rgb_tensor(torch, args.bg_color, device, dtype)
+    target_reader = TargetMediaReader(args.video_target_bgr, w, h) if (args.bg_mode == "target_media" and args.video_target_bgr) else None
+
+    emit_stage(0.78, "Estimando mapa de profundidad...")
+    with torch.no_grad():
+        depth_mask, depth_vis = depth_est.predict(src_t, args.depth_cutoff, args.depth_softness, want_vis=True)
+        pha = postprocess_alpha(torch, args, depth_mask)
+        fgr = src_t
+        com_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
+        pha_t = pha.repeat(1, 3, 1, 1)
+
+    if target_reader is not None:
+        target_reader.close()
+
+    emit_stage(0.92, "Guardando capas de vista previa...")
+    preview_dir = args.preview_dir or os.path.join(models_dir, "..", "preview_cache")
+    src_path = os.path.join(preview_dir, "preview_src.png")
+    com_path = os.path.join(preview_dir, "preview_com.png")
+    pha_path = os.path.join(preview_dir, "preview_pha.png")
+    fgr_path = os.path.join(preview_dir, "preview_fgr.png")
+    depth_path = os.path.join(preview_dir, "preview_depth.png")
+    save_preview_bgr_array(rgb, src_path)
+    save_preview_rgb_or_rgba(com_t, com_path)
+    save_preview_rgb_or_rgba(pha_t, pha_path)
+    save_preview_rgb_or_rgba(fgr, fgr_path)
+    save_preview_rgb_or_rgba(depth_vis, depth_path)
+
+    emit({
+        "type": "preview_done",
+        "frame": idx,
+        "width": w,
+        "height": h,
+        "src_path": src_path,
+        "out_path": com_path,
+        "com_path": com_path,
+        "pha_path": pha_path,
+        "fgr_path": fgr_path,
+        "depth_path": depth_path,
+        "err_path": "",
+        "ref_path": "",
+    })
+
+
+def handle_export_depth_only(args: argparse.Namespace) -> None:
+    emit_stage(0.05, "Cargando PyTorch y mapa de profundidad...")
+    import torch
+
+    device = resolve_device(torch, args.device)
+    use_fp16 = bool(args.fp16 and device.type == "cuda")
+    dtype = torch.float16 if use_fp16 else torch.float32
+    models_dir = resolve_models_dir(args)
+    depth_est = DepthEstimator(torch, device, models_dir, use_fp16, stage_start=0.10, stage_end=0.35)
+
+    info = probe_video(args.video_src)
+    w = args.video_resize[0] if args.video_resize else info["width"]
+    h = args.video_resize[1] if args.video_resize else info["height"]
+    fps = info["fps"]
+    total = info["frame_count"]
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    preview_dir = args.preview_dir or os.path.join(models_dir, "..", "preview_cache")
+    os.makedirs(preview_dir, exist_ok=True)
+    live_out_path = os.path.join(preview_dir, "export_live.png")
+
+    writers = setup_writers(args, fps, w, h, allow_ref=False)
+    target_reader = TargetMediaReader(args.video_target_bgr, w, h) if (args.bg_mode == "target_media" and args.video_target_bgr) else None
+    solid_bg = parse_rgb_tensor(torch, args.bg_color, device, dtype)
+
+    emit_stage(0.45, "Iniciando exportación por profundidad...")
+    reader = ThreadedVideoReader(args.video_src, w, h)
+    t_start = time.time()
+    frame_idx = 0
+    want_depth_vis = "depth" in writers
+
+    with torch.no_grad():
+        while True:
+            rgb = reader.read_next()
+            if rgb is None:
+                break
+
+            src_t = torch.from_numpy(rgb).to(device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
+            depth_mask, depth_vis = depth_est.predict(src_t, args.depth_cutoff, args.depth_softness, want_vis=want_depth_vis)
+            pha = postprocess_alpha(torch, args, depth_mask)
+            fgr = src_t
+
+            com_vis = None
+            if "com" in writers:
+                com_vis = compose_output(torch, args, fgr, pha, solid_bg, target_reader)
+                writers["com"].add(com_vis)
+            if "pha" in writers:
+                writers["pha"].add(pha)
+            if "fgr" in writers:
+                writers["fgr"].add(fgr)
+            if "depth" in writers and depth_vis is not None:
+                writers["depth"].add(depth_vis)
+
+            frame_idx += 1
+            elapsed = max(time.time() - t_start, 1e-4)
+            cur_fps = frame_idx / elapsed
+            rem = max(total - frame_idx, 0)
+            eta = rem / max(cur_fps, 1e-4)
+
+            if (frame_idx == 1) or (frame_idx % 5 == 0) or (frame_idx >= total):
+                preview_path = ""
+                if frame_idx % 15 == 1 or frame_idx >= total:
+                    vis = com_vis if com_vis is not None else pha.repeat(1, 3, 1, 1)
+                    save_preview_rgb_or_rgba(vis, live_out_path)
+                    preview_path = live_out_path
+                emit({
+                    "type": "progress",
+                    "frame": frame_idx,
+                    "total": max(total, frame_idx),
+                    "fps": round(cur_fps, 2),
+                    "eta": round(eta, 1),
+                    "preview_path": preview_path,
+                })
+
+    reader.close()
+    if target_reader is not None:
+        target_reader.close()
+    for w_obj in writers.values():
+        w_obj.close()
+
+    emit({
+        "type": "export_done",
+        "output_dir": args.output_dir,
+        "frames": frame_idx,
+        "elapsed": round(time.time() - t_start, 2),
+    })
+
+
 # -------------------- RVM Engine --------------------
 
 
@@ -681,6 +930,12 @@ def handle_preview_rvm(args: argparse.Namespace) -> None:
 
     emit_stage(0.56, "Inicializando red neuronal en GPU/CPU...")
     model = torch.jit.load(model_path, map_location=device).eval()
+
+    depth_est = None
+    if args.depth_mode == "hybrid":
+        depth_est = DepthEstimator(
+            torch, device, resolve_models_dir(args), use_fp16, stage_start=0.58, stage_end=0.65
+        )
 
     info = probe_video(args.video_src)
     w = args.video_resize[0] if args.video_resize else info["width"]
@@ -721,6 +976,13 @@ def handle_preview_rvm(args: argparse.Namespace) -> None:
         raise RuntimeError(f"No se pudo leer el fotograma {idx}")
 
     emit_stage(0.88, "Refinando máscara y componiendo capas...")
+    depth_vis = None
+    if depth_est is not None:
+        with torch.no_grad():
+            depth_mask, depth_vis = depth_est.predict(
+                src_t, args.depth_cutoff, args.depth_softness, want_vis=True
+            )
+            pha = pha * depth_mask.to(pha.dtype)
     pha = postprocess_alpha(torch, args, pha)
     com_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
     pha_t = pha.repeat(1, 3, 1, 1)
@@ -733,10 +995,13 @@ def handle_preview_rvm(args: argparse.Namespace) -> None:
     com_path = os.path.join(preview_dir, "preview_com.png")
     pha_path = os.path.join(preview_dir, "preview_pha.png")
     fgr_path = os.path.join(preview_dir, "preview_fgr.png")
+    depth_path = os.path.join(preview_dir, "preview_depth.png") if depth_vis is not None else ""
     save_preview_bgr_array(last_rgb, src_path)
     save_preview_rgb_or_rgba(com_t, com_path)
     save_preview_rgb_or_rgba(pha_t, pha_path)
     save_preview_rgb_or_rgba(fgr, fgr_path)
+    if depth_vis is not None:
+        save_preview_rgb_or_rgba(depth_vis, depth_path)
 
     emit({
         "type": "preview_done",
@@ -748,6 +1013,7 @@ def handle_preview_rvm(args: argparse.Namespace) -> None:
         "com_path": com_path,
         "pha_path": pha_path,
         "fgr_path": fgr_path,
+        "depth_path": depth_path,
         "err_path": "",
         "ref_path": "",
     })
@@ -763,6 +1029,12 @@ def handle_export_rvm(args: argparse.Namespace) -> None:
 
     emit_stage(0.36, "Inicializando red neuronal en GPU/CPU...")
     model = torch.jit.load(model_path, map_location=device).eval()
+
+    depth_est = None
+    if args.depth_mode == "hybrid":
+        depth_est = DepthEstimator(
+            torch, device, resolve_models_dir(args), use_fp16, stage_start=0.38, stage_end=0.44
+        )
 
     info = probe_video(args.video_src)
     w = args.video_resize[0] if args.video_resize else info["width"]
@@ -796,6 +1068,12 @@ def handle_export_rvm(args: argparse.Namespace) -> None:
 
             src_t = torch.from_numpy(rgb).to(device, non_blocking=True).permute(2, 0, 1).unsqueeze(0).to(dtype).div_(255.0)
             fgr, pha, *rec = model(src_t, *rec, downsample_ratio)
+            depth_vis = None
+            if depth_est is not None:
+                d_mask, depth_vis = depth_est.predict(
+                    src_t, args.depth_cutoff, args.depth_softness, want_vis=("depth" in writers)
+                )
+                pha = pha * d_mask.to(pha.dtype)
             pha = postprocess_alpha(torch, args, pha)
 
             com_vis = None
@@ -806,6 +1084,8 @@ def handle_export_rvm(args: argparse.Namespace) -> None:
                 writers["pha"].add(pha)
             if "fgr" in writers:
                 writers["fgr"].add(fgr)
+            if "depth" in writers and depth_vis is not None:
+                writers["depth"].add(depth_vis)
 
             frame_idx += 1
             elapsed = max(time.time() - t_start, 1e-4)
@@ -919,8 +1199,20 @@ def handle_preview_bgmv2(args: argparse.Namespace) -> None:
     solid_bg = parse_rgb_tensor(torch, args.bg_color, device, torch.float32)
 
     emit_stage(0.84, "Ejecutando inferencia BackgroundMattingV2...")
+    depth_est = None
+    if args.depth_mode == "hybrid":
+        depth_est = DepthEstimator(
+            torch, device, resolve_models_dir(args), use_half, stage_start=0.85, stage_end=0.90
+        )
+
+    depth_vis = None
     with torch.no_grad():
         pha, fgr, err_up, ref_up = run_bgmv2_frame(args, torch, F, model, is_ts, src_t, bgr_t, use_half)
+        if depth_est is not None:
+            d_mask, depth_vis = depth_est.predict(
+                src_t, args.depth_cutoff, args.depth_softness, want_vis=True
+            )
+            pha = pha * d_mask.to(pha.dtype)
         pha = postprocess_alpha(torch, args, pha)
         com_t = compose_output(torch, args, fgr, pha, solid_bg, target_reader, frame_idx=idx)
         pha_t = pha.repeat(1, 3, 1, 1)
@@ -935,6 +1227,7 @@ def handle_preview_bgmv2(args: argparse.Namespace) -> None:
     com_path = os.path.join(preview_dir, "preview_com.png")
     pha_path = os.path.join(preview_dir, "preview_pha.png")
     fgr_path = os.path.join(preview_dir, "preview_fgr.png")
+    depth_path = os.path.join(preview_dir, "preview_depth.png") if depth_vis is not None else ""
     err_path = os.path.join(preview_dir, "preview_err.png")
     ref_path = os.path.join(preview_dir, "preview_ref.png") if ref_t is not None else ""
 
@@ -942,6 +1235,8 @@ def handle_preview_bgmv2(args: argparse.Namespace) -> None:
     save_preview_rgb_or_rgba(com_t, com_path)
     save_preview_rgb_or_rgba(pha_t, pha_path)
     save_preview_rgb_or_rgba(fgr, fgr_path)
+    if depth_vis is not None:
+        save_preview_rgb_or_rgba(depth_vis, depth_path)
     save_preview_rgb_or_rgba(err_t, err_path)
     if ref_t is not None:
         save_preview_rgb_or_rgba(ref_t, ref_path)
@@ -956,6 +1251,7 @@ def handle_preview_bgmv2(args: argparse.Namespace) -> None:
         "com_path": com_path,
         "pha_path": pha_path,
         "fgr_path": fgr_path,
+        "depth_path": depth_path,
         "err_path": err_path,
         "ref_path": ref_path,
     })
@@ -991,6 +1287,11 @@ def handle_export_bgmv2(args: argparse.Namespace) -> None:
         bgr_base = Image.open(args.video_bgr).convert("RGB").resize((w, h), Image.BILINEAR)
 
     emit_stage(0.40, "Iniciando exportación de fotogramas...")
+    depth_est = None
+    if args.depth_mode == "hybrid":
+        depth_est = DepthEstimator(
+            torch, device, resolve_models_dir(args), use_half, stage_start=0.35, stage_end=0.42
+        )
     bgr_tensor_static = to_tensor(bgr_base).unsqueeze(0).to(device, non_blocking=True)
     aligner = HomographicAlignment() if args.preprocess_alignment else None
 
@@ -1020,6 +1321,12 @@ def handle_export_bgmv2(args: argparse.Namespace) -> None:
                 bgr_t = bgr_tensor_static
 
             pha, fgr, err_up, ref_up = run_bgmv2_frame(args, torch, F, model, is_ts, src_t, bgr_t, use_half)
+            depth_vis = None
+            if depth_est is not None:
+                d_mask, depth_vis = depth_est.predict(
+                    src_t, args.depth_cutoff, args.depth_softness, want_vis=("depth" in writers)
+                )
+                pha = pha * d_mask.to(pha.dtype)
             pha = postprocess_alpha(torch, args, pha)
 
             com_vis = None
@@ -1034,6 +1341,8 @@ def handle_export_bgmv2(args: argparse.Namespace) -> None:
                 writers["err"].add(err_up)
             if "ref" in writers and ref_up is not None:
                 writers["ref"].add(ref_up)
+            if "depth" in writers and depth_vis is not None:
+                writers["depth"].add(depth_vis)
 
             frame_idx += 1
             elapsed = max(time.time() - t_start, 1e-4)
@@ -1083,12 +1392,16 @@ def main() -> None:
             extract_single_frame(args.video_src, args.frame_index, out)
             emit({"type": "extract_done", "path": out})
         elif args.mode == "preview":
-            if args.engine == "rvm":
+            if args.depth_mode == "only":
+                handle_preview_depth_only(args)
+            elif args.engine == "rvm":
                 handle_preview_rvm(args)
             else:
                 handle_preview_bgmv2(args)
         elif args.mode == "export":
-            if args.engine == "rvm":
+            if args.depth_mode == "only":
+                handle_export_depth_only(args)
+            elif args.engine == "rvm":
                 handle_export_rvm(args)
             else:
                 handle_export_bgmv2(args)

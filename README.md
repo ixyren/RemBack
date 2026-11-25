@@ -14,6 +14,9 @@ Permite eliminar el fondo de videos o reemplazarlo por pantalla verde, transpare
 - **Rápido y preciso con o sin frame de referencia**:
   - **Sin foto de referencia (Automático / RVM FP16)**: usa redes recurrentes TorchScript FP16 (`rvm_resnet50_fp16` / `rvm_mobilenetv3_fp16`) con memoria temporal para recortes limpios de cabello y bordes a alta velocidad en GPU.
   - **Con foto de referencia (BackgroundMattingV2)**: autodetección de arquitectura (`mobilenetv2`, `resnet50`, `resnet101`) desde el `.pth`, aceleración FP16 CUDA y reconstrucción opcional del fondo si no tienes captura limpia.
+- **Recorte por mapa de profundidad (Depth Anything V2)**:
+  - **Modo Híbrido (Matting + Profundidad)**: combina la precisión en cabello de RVM/BackgroundMattingV2 con la distancia real a cámara para eliminar personas detrás, sillas u objetos lejanos.
+  - **Modo Solo Profundidad**: recorta cualquier sujeto u objeto según su cercanía con controles de **Distancia de corte** y **Transición**, e incluye capa instantánea **Profundidad** en la vista previa.
 - **Ajuste de máscara, tolerancia y limpieza de artefactos**:
   - Controles de **Tolerancia al fondo**, **Suavizado de borde**, **Expansión/Contracción** y **Eliminación automática de artefactos sueltos** aplicables tanto en la vista previa como en la exportación final.
 - **Vista previa en vivo, cambio de capas instantáneo y barras de progreso detalladas**:
@@ -30,7 +33,7 @@ Permite eliminar el fondo de videos o reemplazarlo por pantalla verde, transpare
 
 ## Instalación (Windows)
 
-1. Descarga **`RemBack-v1.3.0-Setup.exe`** desde la sección [Releases](https://github.com/ixyren/RemBack/releases/latest).
+1. Descarga **`RemBack-v1.4.0-Setup.exe`** desde la sección [Releases](https://github.com/ixyren/RemBack/releases/latest).
 2. Ejecuta el instalador (si ya tienes una versión anterior, la detectará y la actualizará automáticamente).
 3. Al abrir **RemBack**, haz clic en **Actualizaciones** si aún no tienes configurado el entorno Python/PyTorch.
 
@@ -48,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File .\build_release.ps1
 
 Genera:
 - `target\release\remback.exe`
-- `dist\RemBack-v1.3.0-Setup.exe`
+- `dist\RemBack-v1.4.0-Setup.exe`
 
 ---
 
